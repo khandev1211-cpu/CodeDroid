@@ -1,0 +1,43 @@
+.files-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.files-content { flex: 1; overflow-y: auto; }
+.tree-root { padding: 4px 0; }
+.tree-folder-name {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-muted);
+  padding: 6px 12px 4px;
+}
+.tree-item {
+  display: flex; align-items: center; gap: 5px; height: 22px;
+  cursor: pointer; font-size: 13px; color: var(--text-muted);
+  border-radius: 0; position: relative; transition: background 0.05s;
+  white-space: nowrap; overflow: hidden;
+}
+.tree-item:hover { background: var(--bg-hover); color: var(--text); }
+.tree-item.active { background: var(--bg-active); color: var(--text); }
+.tree-arrow { display: flex; align-items: center; flex-shrink: 0; color: var(--text-dim); }
+.tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.tree-rename-input {
+  flex: 1; background: var(--bg-input); border: 1px solid var(--accent);
+  color: var(--text); font-size: 13px; font-family: inherit;
+  padding: 1px 4px; border-radius: 2px; outline: none;
+}
+.git-badge {
+  font-size: 10px; font-weight: 600; flex-shrink: 0; padding-right: 8px;
+}
+.fi-dir { color: var(--accent); flex-shrink: 0; }
+.fi-code { color: var(--syn-func); flex-shrink: 0; }
+.fi-text { color: var(--syn-string); flex-shrink: 0; }
+.fi-file { color: var(--text-dim); flex-shrink: 0; }
+
+.ctx-menu {
+  position: absolute; right: 8px; z-index: 100; background: var(--bg-panel);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 140px; padding: 4px;
+}
+.ctx-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: var(--radius-sm);
+  font-size: 12px; cursor: pointer; color: var(--text-muted);
+}
+.ctx-item:hover { background: var(--bg-hover); color: var(--text); }
+.ctx-item.danger:hover { background: rgba(241,76,76,0.1); color: var(--git-deleted); }

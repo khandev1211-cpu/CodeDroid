@@ -1,0 +1,23 @@
+.status-bar {
+  display: flex; align-items: center; height: 22px; flex-shrink: 0;
+  background: var(--status-bar); color: var(--status-text);
+  font-size: 11px; padding: 0 4px; overflow: hidden;
+}
+.status-left, .status-right { display: flex; align-items: center; gap: 0; }
+.status-center { flex: 1; display: flex; justify-content: center; align-items: center; }
+.status-right { margin-left: auto; }
+.status-item {
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 8px; height: 22px; white-space: nowrap;
+  opacity: 0.9;
+}
+.status-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--status-text); font-size: 11px; font-family: inherit;
+  transition: background 0.1s;
+}
+.status-btn:hover { background: rgba(255,255,255,0.1); }
+.status-divider {
+  width: 1px; height: 14px; background: rgba(255,255,255,0.15); flex-shrink: 0;
+}
+.status-git-counts { display: flex; gap: 4px; font-size: 10px; }

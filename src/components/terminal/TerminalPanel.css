@@ -1,0 +1,30 @@
+.terminal-panel {
+  display: flex; flex-direction: column; height: 100%;
+  background: var(--terminal); overflow: hidden;
+}
+.terminal-header {
+  display: flex; align-items: center; height: 32px; flex-shrink: 0;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  padding: 0 6px;
+}
+.terminal-tabs { display: flex; align-items: center; flex: 1; overflow-x: auto; gap: 2px; }
+.terminal-tabs::-webkit-scrollbar { height: 0; }
+.term-tab {
+  display: flex; align-items: center; gap: 5px;
+  padding: 0 10px; height: 28px; border-radius: var(--radius);
+  font-size: 11px; color: var(--text-dim); cursor: pointer;
+  white-space: nowrap; flex-shrink: 0; transition: all 0.1s;
+}
+.term-tab:hover { background: var(--bg-hover); color: var(--text-muted); }
+.term-tab.active { background: var(--bg-hover); color: var(--text); }
+.term-tab-close {
+  display: flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border: none; border-radius: 2px;
+  background: transparent; color: var(--text-dim); cursor: pointer;
+}
+.term-tab-close:hover { background: var(--border); color: var(--text); }
+.terminal-body { flex: 1; overflow: hidden; }
+
+/* xterm overrides */
+.xterm-viewport::-webkit-scrollbar { width: 6px; }
+.xterm-viewport::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }

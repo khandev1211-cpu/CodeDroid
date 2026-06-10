@@ -1,0 +1,18 @@
+.activity-bar {
+  width: 48px; display: flex; flex-direction: column; justify-content: space-between;
+  background: var(--bg-panel); border-right: 1px solid var(--border-light);
+  flex-shrink: 0; padding: 4px 0;
+}
+.activity-top, .activity-bottom { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.ab-btn {
+  position: relative; width: 44px; height: 44px; border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--text-dim); border-radius: var(--radius);
+  transition: all 0.1s; margin: 0 2px;
+}
+.ab-btn:hover { color: var(--text); background: var(--bg-hover); }
+.ab-btn.active { color: var(--text); }
+.ab-indicator {
+  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 2px; height: 24px; background: var(--text); border-radius: 0 2px 2px 0;
+}
