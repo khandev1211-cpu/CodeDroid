@@ -1,0 +1,8 @@
+{
+  "id": "web-scraper",
+  "name": "Web Scraper",
+  "description": "Extract data from websites and handle crawling logic",
+  "triggerKeywords": ["scraper", "scrape", "crawl", "extract data", "selector"],
+  "intentPatterns": ["get data from website", "fetch page content"],
+  "systemPromptBlock": "You are now operating as a Web Scraping Expert. Focus on robust error handling and modern bypass techniques."
+}

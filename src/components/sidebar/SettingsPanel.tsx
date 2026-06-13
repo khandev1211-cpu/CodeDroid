@@ -49,21 +49,33 @@ async function fetchModels(provider: string, apiKey: string, host: string): Prom
 }
 
 export default function SettingsPanel() {
-  const { settings, updateSettings, applyThemeById } = useStore()
+  const { settings, updateSettings, applyThemeById, availableModels, fetchModels, aiError, setAiError } = useStore()
   const [tab, setTab] = useState<Tab>("themes")
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({})
-  const [models, setModels] = useState<Record<string, string[]>>(STATIC_MODELS)
   const [fetchingModels, setFetchingModels] = useState<string | null>(null)
-  const [modelsFetched, setModelsFetched] = useState<Record<string, boolean>>({})
 
   const toggleKey = (k: string) => setShowKeys(s => ({ ...s, [k]: !s[k] }))
 
+  // Auto-fetch on tab change or host change
+  useEffect(() => {
+    if (tab === "ai") {
+      if (availableModels.ollama.length === 0) fetchModels("ollama")
+      if (settings.groqKey && availableModels.groq.length <= 3) fetchModels("groq")
+      if (settings.geminiKey && availableModels.gemini.length <= 2) fetchModels("gemini")
+    }
+  }, [tab])
+
+  useEffect(() => {
+    if (tab === "ai" && settings.ollamaHost) {
+      const timer = setTimeout(() => fetchModels("ollama"), 1000)
+      return () => clearTimeout(timer)
+    }
+  }, [settings.ollamaHost, tab])
+
   const loadModels = async (provider: string) => {
+    if (fetchingModels) return
     setFetchingModels(provider)
-    const key = provider === "groq" ? settings.groqKey : provider === "gemini" ? settings.geminiKey : provider === "claude" ? settings.claudeKey : ""
-    const fetched = await fetchModels(provider, key, settings.ollamaHost)
-    setModels(prev => ({ ...prev, [provider]: fetched.length ? fetched : STATIC_MODELS[provider] || [] }))
-    setModelsFetched(prev => ({ ...prev, [provider]: true }))
+    await fetchModels(provider)
     setFetchingModels(null)
   }
 
@@ -176,6 +188,19 @@ export default function SettingsPanel() {
         {/* ── AI SETTINGS ── */}
         {tab === "ai" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {aiError && (
+              <div style={{
+                background: "rgba(255, 71, 71, 0.1)", border: "1px solid #ff474744",
+                padding: "8px 10px", borderRadius: 6, color: "#ff8080", fontSize: 11,
+                display: "flex", flexDirection: "column", gap: 4
+              }}>
+                <div style={{ fontWeight: 600, display: "flex", justifyContent: "space-between" }}>
+                  <span>Connection Error</span>
+                  <button onClick={() => setAiError(null)} style={{ background: "none", border: "none", color: "inherit", cursor: "pointer" }}>✕</button>
+                </div>
+                {aiError}
+              </div>
+            )}
             {/* Provider selector */}
             <div>
               <div style={{ fontSize: 11, color: "var(--text-dim)", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>Active Provider</div>
@@ -204,7 +229,7 @@ export default function SettingsPanel() {
               const modelMap: Record<string, keyof typeof settings> = { groq: "groqModel", gemini: "geminiModel", claude: "claudeModel", ollama: "ollamaModel" }
               const keyField = keyMap[p]
               const modelField = modelMap[p]
-              const providerModels = models[p] || STATIC_MODELS[p] || []
+              const providerModels = availableModels[p] || []
 
               return (
                 <div key={p} style={{
@@ -237,11 +262,15 @@ export default function SettingsPanel() {
                   {/* Model selector with fetch */}
                   <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
                     <label style={{ fontSize: 11, color: "var(--text-muted)", flex: 1 }}>Model</label>
-                    <button className="icon-btn" style={{ width: 22, height: 22 }}
-                      onClick={() => loadModels(p)} title="Fetch available models">
+                    <button className="icon-btn" style={{ width: 22, height: 22, pointerEvents: "auto", cursor: "pointer" }}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        loadModels(p);
+                      }} title="Fetch available models">
                       {fetchingModels === p
                         ? <Loader2 size={12} className="spin" style={{ color: "var(--accent)" }} />
-                        : <RefreshCw size={12} style={{ color: modelsFetched[p] ? "var(--git-added)" : "var(--text-dim)" }} />}
+                        : <RefreshCw size={12} style={{ color: providerModels.length > 0 ? "var(--git-added)" : "var(--text-dim)" }} />}
                     </button>
                   </div>
                   <select className="input" value={settings[modelField] as string}
@@ -250,7 +279,7 @@ export default function SettingsPanel() {
                       ? <option value="">No models — click ↻ to fetch</option>
                       : providerModels.map(m => <option key={m} value={m}>{m}</option>)}
                   </select>
-                  {modelsFetched[p] && (
+                  {providerModels.length > 0 && (
                     <div style={{ fontSize: 10, color: "var(--git-added)", marginTop: 4, display: "flex", alignItems: "center", gap: 4 }}>
                       <CheckCircle2 size={10} /> {providerModels.length} models loaded
                     </div>

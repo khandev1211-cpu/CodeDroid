@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import Editor, { OnMount } from '@monaco-editor/react'
 import { X, Circle, ChevronRight, SplitSquareHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
@@ -60,7 +60,7 @@ function Breadcrumbs() {
 export default function EditorArea() {
   const {
     openFiles, activeFileIndex, updateFileContent, saveFile,
-    settings, theme, setInlineAi
+    settings, theme, setInlineAi, openNewFolder
   } = useStore()
   const editorRef = useRef<any>(null)
   const [editorReady, setEditorReady] = useState(false)
@@ -138,6 +138,57 @@ export default function EditorArea() {
     monaco.editor.setTheme(getMonacoTheme())
     setEditorReady(true)
 
+    // Re-apply theme whenever applyTheme() fires the custom event
+    const onThemeChange = (e: Event) => {
+      const newTheme = (e as CustomEvent).detail
+      const c = newTheme.colors
+      const isDark = newTheme.category !== 'light'
+      const themeId = isDark ? 'codedroid-dark' : 'codedroid-light'
+      monaco.editor.defineTheme(themeId, {
+        base: isDark ? 'vs-dark' : 'vs',
+        inherit: true,
+        rules: [
+          { token: 'keyword',    foreground: c.keyword.slice(1) },
+          { token: 'string',     foreground: c.string.slice(1) },
+          { token: 'comment',    foreground: c.comment.slice(1), fontStyle: 'italic' },
+          { token: 'number',     foreground: c.number.slice(1) },
+          { token: 'identifier', foreground: c.variable.slice(1) },
+          { token: 'type',       foreground: c.type.slice(1) },
+          { token: 'function',   foreground: c.func.slice(1) },
+          { token: 'operator',   foreground: c.operator.slice(1) },
+        ],
+        colors: {
+          'editor.background':               c.bgEditor,
+          'editor.foreground':               c.text,
+          'editor.lineHighlightBackground':  c.lineHighlight,
+          'editor.selectionBackground':      c.selection,
+          'editorLineNumber.foreground':     c.textDim,
+          'editorLineNumber.activeForeground': c.textMuted,
+          'editor.findMatchBackground':      c.accentSoft,
+          'editorCursor.foreground':         c.accent,
+          'editorWhitespace.foreground':     c.border,
+          'editorIndentGuide.background':    c.borderLight,
+          'editorIndentGuide.activeBackground': c.border,
+          'scrollbarSlider.background':      c.scrollbar + '88',
+          'scrollbarSlider.hoverBackground': c.scrollbar,
+          'editorWidget.background':         c.bgPanel,
+          'editorWidget.border':             c.border,
+          'input.background':                c.bgInput,
+          'input.foreground':                c.text,
+          'input.border':                    c.border,
+          'focusBorder':                     c.accent,
+          'dropdown.background':             c.bgPanel,
+          'list.hoverBackground':            c.bgHover,
+          'list.activeSelectionBackground':  c.bgActive,
+          'list.focusBackground':            c.bgActive,
+        }
+      })
+      monaco.editor.setTheme(themeId)
+    }
+    window.addEventListener('codedroid-theme-change', onThemeChange)
+    // Store cleanup fn on the editor instance so the effect cleanup can reach it
+    ;(editor as any)._themeCleanup = () => window.removeEventListener('codedroid-theme-change', onThemeChange)
+
     // Ctrl+S = save
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       saveFile(activeFileIndex)
@@ -151,6 +202,26 @@ export default function EditorArea() {
       setInlineAi(true, { line, selection: selectedText })
     })
   }
+
+  // Cleanup Monaco theme listener on unmount
+  useEffect(() => {
+    return () => {
+      ;(editorRef.current as any)?._themeCleanup?.()
+    }
+  }, [])
+
+  // Update Monaco model language when file is renamed (extension changes)
+  useEffect(() => {
+    if (!editorRef.current || !file) return
+    const model = editorRef.current.getModel()
+    if (!model) return
+    const monaco = (window as any).monaco
+    if (!monaco) return
+    const currentLang = model.getLanguageId()
+    if (currentLang !== file.language) {
+      monaco.editor.setModelLanguage(model, file.language)
+    }
+  }, [file?.language, file?.path])
 
   const handleChange = (value: string | undefined) => {
     if (value !== undefined && file) {
@@ -169,7 +240,7 @@ export default function EditorArea() {
           <h2 className="welcome-title">CodeDroid IDE</h2>
           <p className="welcome-sub">TypeScript · Python · Rust</p>
           <div className="welcome-actions">
-            <button className="btn btn-primary" onClick={() => window.api?.openFolder()}>
+            <button className="btn btn-primary" onClick={() => openNewFolder()}>
               Open Folder
             </button>
             <button className="btn btn-ghost" onClick={() => window.api?.openFile()}>

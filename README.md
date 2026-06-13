@@ -216,11 +216,19 @@ npm run build
 
 ---
 
+## 👥 Contributors & Links
+
+1. **[khandev1211-cpu](https://github.com/khandev1211-cpu)** — Project Lead & Developer
+2. **[CodeDroid Repository](https://github.com/khandev1211-cpu/CodeDroid)** — Main Project Repository
+
+---
+
 <div align="center">
 
 **CodeDroid v3** — Built with ❤️ using TypeScript, Python & Rust
 
-[![GitHub](https://img.shields.io/badge/GitHub-khandev1211--cpu-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/khandev1211-cpu)
+[![GitHub Profile](https://img.shields.io/badge/GitHub-khandev1211--cpu-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/khandev1211-cpu)
+[![GitHub Repo](https://img.shields.io/badge/Repository-CodeDroid-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/khandev1211-cpu/CodeDroid)
 [![Gmail](https://img.shields.io/badge/Contact-khandev1211@gmail.com-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:khandev1211@gmail.com)
 
 </div>

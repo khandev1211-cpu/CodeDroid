@@ -18,7 +18,7 @@ export default function CommandPalette() {
   useEffect(() => { inputRef.current?.focus() }, [])
 
   const allCommands: Command[] = [
-    { id: 'open-folder',    label: 'Open Folder',          desc: 'Open a project folder',   icon: FileCode,   action: () => window.api?.openFolder() },
+    { id: 'open-folder',    label: 'Open Folder',          desc: 'Open a project folder',   icon: FileCode,   action: () => useStore.getState().openNewFolder() },
     { id: 'open-file',      label: 'Open File',            desc: 'Open a file',             icon: FileCode,   action: () => window.api?.openFile() },
     { id: 'toggle-sidebar', label: 'Toggle Sidebar',       desc: 'Ctrl+B',                  icon: Settings,   action: () => updateSettings({ showSidebar: !settings.showSidebar }) },
     { id: 'toggle-terminal',label: 'Toggle Terminal',      desc: 'Ctrl+J',                  icon: Terminal,   action: () => updateSettings({ showTerminal: !settings.showTerminal }) },

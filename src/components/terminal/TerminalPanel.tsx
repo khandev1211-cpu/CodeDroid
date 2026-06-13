@@ -1,19 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
 import { Terminal, Plus, X, ChevronDown, ChevronUp, Maximize2 } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
+import { getXtermTheme } from '../../themes/themes'
 import './TerminalPanel.css'
 
-function TerminalInstance({ id, active }: { id: string; active: boolean }) {
+function TerminalInstance({ id, active, cwd }: { id: string; active: boolean; cwd?: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<any>(null)
   const fitRef = useRef<any>(null)
-  const { folderPath } = useStore()
+  const { folderPath, theme } = useStore()
 
   useEffect(() => {
     if (!containerRef.current) return
 
     let term: any
     let fitAddon: any
+    let unlistenData: () => void
+    let unlistenExit: () => void
+    let unlistenTheme: () => void
 
     const init = async () => {
       try {
@@ -21,26 +25,17 @@ function TerminalInstance({ id, active }: { id: string; active: boolean }) {
         const { FitAddon } = await import('@xterm/addon-fit')
         const { WebLinksAddon } = await import('@xterm/addon-web-links')
 
+        // Get initial theme from current app theme
+        const initialTheme = getXtermTheme(useStore.getState().theme)
+
         term = new XTerm({
           cursorBlink: true,
-          cursorStyle: 'bar',
+          cursorStyle: 'block',
           fontSize: 13,
           fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-          theme: {
-            background: 'var(--terminal)' || '#1e1e1e',
-            foreground: '#cccccc',
-            cursor: 'var(--accent)' || '#0078d4',
-            black: '#000000', red: '#cd3131', green: '#0dbc79',
-            yellow: '#e5e510', blue: '#2472c8', magenta: '#bc3fbc',
-            cyan: '#11a8cd', white: '#e5e5e5',
-            brightBlack: '#666666', brightRed: '#f14c4c',
-            brightGreen: '#23d18b', brightYellow: '#f5f543',
-            brightBlue: '#3b8eea', brightMagenta: '#d670d6',
-            brightCyan: '#29b8db', brightWhite: '#ffffff',
-          },
+          theme: initialTheme,
           allowTransparency: true,
           scrollback: 5000,
-          rightClickSelectsWord: true,
         })
 
         fitAddon = new FitAddon()
@@ -52,58 +47,49 @@ function TerminalInstance({ id, active }: { id: string; active: boolean }) {
         termRef.current = term
         fitRef.current = fitAddon
 
-        // Welcome message
-        const cwd = folderPath || process.cwd?.() || '~'
-        term.writeln(`\x1b[36mCodeDroid Terminal\x1b[0m · \x1b[33m${cwd}\x1b[0m`)
-        term.writeln('')
-        term.write('\x1b[32m$ \x1b[0m')
-
-        // Handle user input (basic shell simulation)
-        let currentLine = ''
-
-        term.onKey(async ({ key, domEvent }: any) => {
-          const printable = !domEvent.altKey && !domEvent.ctrlKey && !domEvent.metaKey
-
-          if (domEvent.keyCode === 13) { // Enter
-            term.writeln('')
-            const cmd = currentLine.trim()
-            currentLine = ''
-
-            if (cmd) {
-              try {
-                if (window.api) {
-                  const result = await window.api.shellExec(cmd, folderPath || undefined)
-                  if (result.stdout) {
-                    result.stdout.split('\n').forEach((line: string) => {
-                      if (line) term.writeln(line)
-                    })
-                  }
-                  if (result.stderr) {
-                    result.stderr.split('\n').forEach((line: string) => {
-                      if (line) term.writeln(`\x1b[31m${line}\x1b[0m`)
-                    })
-                  }
-                }
-              } catch (e: any) {
-                term.writeln(`\x1b[31mError: ${e.message}\x1b[0m`)
-              }
-            }
-
-            term.write('\x1b[32m$ \x1b[0m')
-          } else if (domEvent.keyCode === 8) { // Backspace
-            if (currentLine.length > 0) {
-              currentLine = currentLine.slice(0, -1)
-              term.write('\b \b')
-            }
-          } else if (domEvent.keyCode === 67 && domEvent.ctrlKey) { // Ctrl+C
-            currentLine = ''
-            term.writeln('^C')
-            term.write('\x1b[32m$ \x1b[0m')
-          } else if (printable) {
-            currentLine += key
-            term.write(key)
+        // Listen for theme changes and update xterm immediately
+        const onThemeChange = (e: Event) => {
+          const newTheme = (e as CustomEvent).detail
+          if (termRef.current) {
+            termRef.current.options.theme = getXtermTheme(newTheme)
+            // Force full re-render so colors take effect
+            termRef.current.refresh(0, termRef.current.rows - 1)
           }
-        })
+        }
+        window.addEventListener('codedroid-theme-change', onThemeChange)
+        unlistenTheme = () => window.removeEventListener('codedroid-theme-change', onThemeChange)
+
+        // Create the real PTY process in the main process
+        if (window.api) {
+          await window.api.termCreate(id, cwd || folderPath)
+
+          // Data from PTY -> UI
+          unlistenData = window.api.onTermData(id, (data: string) => {
+            term.write(data)
+          })
+
+          // Exit from PTY
+          unlistenExit = window.api.onTermExit(id, ({ exitCode }: any) => {
+            term.writeln(`\r\n[Process exited with code ${exitCode}]`)
+          })
+
+          // UI -> PTY
+          term.onData((data: string) => {
+            window.api.termWrite(id, data)
+          })
+
+          // Resize PTY
+          const resize = () => {
+            const dims = fitAddon.proposeDimensions()
+            if (dims) {
+              window.api.termResize(id, dims.cols, dims.rows)
+              fitAddon.fit()
+            }
+          }
+
+          window.addEventListener('resize', resize)
+          setTimeout(resize, 100) // Initial fit
+        }
 
       } catch (e) {
         console.warn('Terminal init failed:', e)
@@ -113,12 +99,23 @@ function TerminalInstance({ id, active }: { id: string; active: boolean }) {
     init()
 
     const resizeObserver = new ResizeObserver(() => {
-      try { fitRef.current?.fit() } catch {}
+      if (fitRef.current && termRef.current && window.api) {
+        const dims = fitRef.current.proposeDimensions()
+        if (dims) {
+          window.api.termResize(id, dims.cols, dims.rows)
+          fitRef.current.fit()
+        }
+      }
     })
+
     if (containerRef.current) resizeObserver.observe(containerRef.current)
 
     return () => {
       resizeObserver.disconnect()
+      unlistenData?.()
+      unlistenExit?.()
+      unlistenTheme?.()
+      if (window.api) window.api.termKill(id)
       term?.dispose()
     }
   }, [id])
@@ -186,7 +183,7 @@ export default function TerminalPanel() {
       </div>
       <div className="terminal-body">
         {terminalTabs.map(tab => (
-          <TerminalInstance key={tab.id} id={tab.id} active={activeTerminalTab === tab.id} />
+          <TerminalInstance key={tab.id} id={tab.id} active={activeTerminalTab === tab.id} cwd={tab.cwd} />
         ))}
       </div>
     </div>

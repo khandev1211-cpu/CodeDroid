@@ -4,6 +4,7 @@ import { themes, applyTheme, Theme } from '../themes/themes'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export type AiProvider = 'groq' | 'gemini' | 'ollama' | 'claude'
+export type ChatMode = 'plan' | 'agent' | 'ask'
 export type Panel = 'files' | 'search' | 'git' | 'extensions' | 'settings'
 
 export interface OpenFile {
@@ -18,6 +19,23 @@ export interface OpenFile {
   splitGroup?: 0 | 1
 }
 
+export interface AgentStep {
+  id: string
+  tool: string
+  input: string
+  output?: string
+  status: 'running' | 'success' | 'error'
+}
+
+export interface PlanStep {
+  id: string
+  title: string
+  description: string
+  estimatedComplexity: string
+  status?: 'pending' | 'running' | 'completed' | 'failed'
+  result?: string
+}
+
 export interface AiMessage {
   id: string
   role: 'user' | 'assistant' | 'tool'
@@ -26,6 +44,10 @@ export interface AiMessage {
   toolName?: string
   timestamp: number
   isStreaming?: boolean
+  mode?: ChatMode
+  appliedSkills?: string[]
+  agentSteps?: AgentStep[]
+  planSteps?: PlanStep[]
 }
 
 export interface GitFileStatus {
@@ -46,6 +68,7 @@ export interface TerminalTabDef {
   id: string
   name: string
   pid?: number
+  cwd?: string
 }
 
 // ─── Settings interface ───────────────────────────────────────────────────────
@@ -60,6 +83,7 @@ export interface Settings {
   ollamaModel: string
   claudeModel: string
   activeProvider: AiProvider
+  activeMode: ChatMode
   // Editor
   fontSize: number
   fontFamily: string
@@ -85,7 +109,7 @@ const defaultSettings: Settings = {
   groqKey: '', geminiKey: '', ollamaHost: 'http://localhost:11434',
   claudeKey: '', groqModel: 'llama3-70b-8192', geminiModel: 'gemini-1.5-pro',
   ollamaModel: 'llama3', claudeModel: 'claude-sonnet-4-20250514',
-  activeProvider: 'groq',
+  activeProvider: 'groq', activeMode: 'ask',
   fontSize: 14, fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
   wordWrap: false, minimap: true, lineNumbers: true, tabSize: 2, autoSave: false,
   sidebarWidth: 240, aiPanelWidth: 340, terminalHeight: 200,
@@ -106,6 +130,16 @@ interface AppStore {
   aiMessages: AiMessage[]
   aiLoading: boolean
   aiError: string | null
+  aiResponseStartTime: number | null
+  aiLastResponseTime: number | null
+
+  // Agent
+  agentRunning: boolean
+  agentPaused: boolean
+  agentCurrentStep: number
+  agentTotalSteps: number
+  agentCurrentTool: string
+  agentWebSocket: WebSocket | null
 
   // Git
   gitFiles: GitFileStatus[]
@@ -130,9 +164,14 @@ interface AppStore {
   commandPaletteOpen: boolean
   inlineAiOpen: boolean
   inlineAiTarget: { line: number; selection: string } | null
+  enhancerLoading: boolean
+
+  // Available models (fetched from APIs)
+  availableModels: Record<string, string[]>
 
   // Actions: Files
   setFolderPath: (p: string | null) => void
+  openNewFolder: () => Promise<void>
   openFile: (file: OpenFile) => void
   closeFile: (index: number) => void
   setActiveFile: (index: number) => void
@@ -140,6 +179,7 @@ interface AppStore {
   saveFile: (index: number) => Promise<void>
   saveAllFiles: () => Promise<void>
   toggleSplit: () => void
+  renameOpenFile: (oldPath: string, newPath: string, newName: string) => void
 
   // Actions: AI
   addAiMessage: (msg: Omit<AiMessage, 'id' | 'timestamp'>) => string
@@ -148,6 +188,16 @@ interface AppStore {
   setAiLoading: (b: boolean) => void
   setAiError: (e: string | null) => void
   sendAiMessage: (text: string) => Promise<void>
+
+  // Actions: Agent
+  setAgentRunning: (running: boolean) => void
+  setAgentPaused: (paused: boolean) => void
+  setAgentStatus: (step: number, total: number, tool: string) => void
+  setAgentWebSocket: (ws: WebSocket | null) => void
+  pauseAgent: () => void
+  stopAgent: () => void
+  resetAgentState: () => void
+  fetchModels: (provider: string) => Promise<void>
 
   // Actions: Git
   loadGitStatus: () => Promise<void>
@@ -165,7 +215,7 @@ interface AppStore {
   replaceAll: () => Promise<void>
 
   // Actions: Terminal
-  addTerminalTab: () => void
+  addTerminalTab: (cwd?: string) => void
   removeTerminalTab: (id: string) => void
   setActiveTerminalTab: (id: string) => void
 
@@ -175,10 +225,23 @@ interface AppStore {
   applyThemeById: (id: string) => void
   setCommandPaletteOpen: (b: boolean) => void
   setInlineAi: (open: boolean, target?: { line: number; selection: string } | null) => void
+  setEnhancerLoading: (b: boolean) => void
 }
 
 let msgIdCounter = 0
 const uid = () => `msg_${++msgIdCounter}_${Date.now()}`
+
+function getLanguage(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() || ''
+  const map: Record<string, string> = {
+    ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+    py: 'python', rs: 'rust', go: 'go', java: 'java', cpp: 'cpp', c: 'c',
+    html: 'html', css: 'css', scss: 'scss', json: 'json', yaml: 'yaml',
+    yml: 'yaml', md: 'markdown', sh: 'shell', toml: 'toml', sql: 'sql',
+    dart: 'dart', swift: 'swift', kt: 'kotlin', rb: 'ruby', php: 'php',
+  }
+  return map[ext] || 'plaintext'
+}
 
 export const useStore = create<AppStore>()(
   persist(
@@ -186,6 +249,9 @@ export const useStore = create<AppStore>()(
       // ── Initial state ──────────────────────────────────────────────────────
       openFiles: [], activeFileIndex: 0, folderPath: null, splitEnabled: false,
       aiMessages: [], aiLoading: false, aiError: null,
+      aiResponseStartTime: null, aiLastResponseTime: null,
+      agentRunning: false, agentPaused: false, agentCurrentStep: 0,
+      agentTotalSteps: 0, agentCurrentTool: '', agentWebSocket: null,
       gitFiles: [], gitBranch: 'main', gitLog: [], commitMessage: '',
       searchQuery: '', searchResults: [], searchLoading: false, replaceQuery: '',
       terminalTabs: [{ id: 'term_1', name: 'Terminal 1' }], activeTerminalTab: 'term_1',
@@ -193,9 +259,54 @@ export const useStore = create<AppStore>()(
       settings: defaultSettings,
       theme: themes[0],
       commandPaletteOpen: false, inlineAiOpen: false, inlineAiTarget: null,
+      enhancerLoading: false,
+      availableModels: {
+        groq: ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"],
+        gemini: ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],
+        claude: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
+        ollama: []
+      },
 
       // ── File actions ───────────────────────────────────────────────────────
       setFolderPath: (p) => set({ folderPath: p }),
+
+      openNewFolder: async () => {
+        if (!window.api) return
+        const p = await window.api.openFolder()
+        if (!p) return
+
+        const { openFiles } = get()
+        const hasDirty = openFiles.some(f => f.isDirty)
+        if (hasDirty) {
+          const ok = confirm('Opening a new project will close current session.\nUnsaved changes will be lost. Continue?')
+          if (!ok) return
+        } else if (openFiles.length > 0) {
+          const ok = confirm('Opening a new project will close current session. Continue?')
+          if (!ok) return
+        }
+
+        // Notify sidecar of new workspace
+        try {
+          await fetch('http://localhost:8765/set-workspace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: p })
+          })
+        } catch { /* sidecar may not be running — non-fatal */ }
+
+        set({
+          folderPath: p,
+          openFiles: [],
+          activeFileIndex: 0,
+          aiMessages: [],
+          searchResults: [],
+          searchQuery: '',
+          gitFiles: [],
+          gitBranch: 'main',
+          gitLog: [],
+          commitMessage: '',
+        })
+      },
 
       openFile: (file) => set((s) => {
         const existing = s.openFiles.findIndex(f => f.path === file.path)
@@ -238,6 +349,14 @@ export const useStore = create<AppStore>()(
 
       toggleSplit: () => set((s) => ({ splitEnabled: !s.splitEnabled })),
 
+      renameOpenFile: (oldPath, newPath, newName) => set((s) => ({
+        openFiles: s.openFiles.map(f =>
+          f.path === oldPath
+            ? { ...f, path: newPath, name: newName, language: getLanguage(newName) }
+            : f
+        )
+      })),
+
       // ── AI actions ─────────────────────────────────────────────────────────
       addAiMessage: (msg) => {
         const id = uid()
@@ -255,128 +374,291 @@ export const useStore = create<AppStore>()(
       setAiLoading: (aiLoading) => set({ aiLoading }),
       setAiError: (aiError) => set({ aiError }),
 
+      // ── Agent actions ──────────────────────────────────────────────────────
+      setAgentRunning: (running) => set({ agentRunning: running }),
+      setAgentPaused: (paused) => set({ agentPaused: paused }),
+      setAgentStatus: (step, total, tool) => set({ agentCurrentStep: step, agentTotalSteps: total, agentCurrentTool: tool }),
+      setAgentWebSocket: (ws) => set({ agentWebSocket: ws }),
+      pauseAgent: () => {
+        const { agentWebSocket, agentPaused } = get()
+        const newPaused = !agentPaused
+        set({ agentPaused: newPaused })
+        if (agentWebSocket && agentWebSocket.readyState === WebSocket.OPEN) {
+          agentWebSocket.send(JSON.stringify({ type: newPaused ? 'pause' : 'resume' }))
+        }
+      },
+      stopAgent: () => {
+        const { agentWebSocket } = get()
+        if (agentWebSocket && agentWebSocket.readyState === WebSocket.OPEN) {
+          agentWebSocket.send(JSON.stringify({ type: 'cancel' }))
+          agentWebSocket.close()
+        }
+        set({ agentRunning: false, agentPaused: false, agentCurrentStep: 0, agentTotalSteps: 0, agentCurrentTool: '', agentWebSocket: null, aiLoading: false })
+      },
+      resetAgentState: () => set({ agentRunning: false, agentPaused: false, agentCurrentStep: 0, agentTotalSteps: 0, agentCurrentTool: '', agentWebSocket: null }),
+
       sendAiMessage: async (text) => {
         const { settings, aiMessages, addAiMessage, updateAiMessage, setAiLoading, openFiles, activeFileIndex } = get()
         const activeFile = openFiles[activeFileIndex]
+        const provider = settings.activeProvider
+        const mode = settings.activeMode || 'ask'
 
         // Add user message
-        addAiMessage({ role: 'user', content: text, provider: settings.activeProvider })
+        addAiMessage({ role: 'user', content: text, provider, mode })
         setAiLoading(true)
+        set({ aiResponseStartTime: Date.now(), aiLastResponseTime: null })
 
         const assistantId = addAiMessage({
-          role: 'assistant', content: '', provider: settings.activeProvider, isStreaming: true
+          role: 'assistant', content: '', provider, isStreaming: true, mode, agentSteps: [], planSteps: []
         })
 
-        try {
-          const history = aiMessages.filter(m => m.role !== 'tool').map(m => ({
-            role: m.role === 'assistant' ? 'assistant' : 'user',
-            content: m.content
-          }))
-
-          const systemPrompt = `You are CodeDroid AI Copilot, an expert coding assistant embedded in an IDE.
+        const systemPrompt = `You are CodeDroid AI Copilot, an expert coding assistant embedded in an IDE.
 ${activeFile ? `\nCurrently open file: ${activeFile.name}\n\`\`\`${activeFile.language}\n${activeFile.content.slice(0, 3000)}\n\`\`\`` : ''}
 Be concise, technical, and precise. Format code with proper markdown code blocks.`
 
-          let fullText = ''
+        const history = aiMessages.filter(m => m.role !== 'tool').map(m => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content
+        }))
 
-          if (settings.activeProvider === 'groq') {
-            const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-              method: 'POST',
-              headers: { 'Authorization': `Bearer ${settings.groqKey}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: settings.groqModel, stream: true, max_tokens: 4096,
-                messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: text }]
-              })
-            })
-            const reader = res.body!.getReader()
-            const dec = new TextDecoder()
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              const chunk = dec.decode(value)
-              for (const line of chunk.split('\n')) {
-                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-                  try {
-                    const d = JSON.parse(line.slice(6))
-                    fullText += d.choices?.[0]?.delta?.content || ''
-                    updateAiMessage(assistantId, fullText, true)
-                  } catch {}
+        // ─── Try Sidecar first (Required for Tools, better for Ollama) ─────────
+        const trySidecar = async () => {
+          return new Promise<boolean>((resolve) => {
+            try {
+              const ws = new WebSocket('ws://127.0.0.1:8765/ws/chat')
+              let fullText = ''
+              let hasReceivedData = false
+
+              ws.onopen = () => {
+                const key = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
+                const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
+
+                ws.send(JSON.stringify({
+                  messages: [...history, { role: 'user', content: text }],
+                  provider, api_key: key, model, host: settings.ollamaHost,
+                  system: systemPrompt,
+                  mode,
+                  skills: []
+                }))
+              }
+
+              ws.onmessage = (event) => {
+                hasReceivedData = true
+                clearTimeout(timeout)
+                const data = JSON.parse(event.data)
+                if (data.type === 'token') {
+                  fullText += data.text
+                  updateAiMessage(assistantId, fullText, true)
+                } else if (data.type === 'tool_start') {
+                  const step = { id: uid(), tool: data.tool, input: JSON.stringify(data.args || {}), status: 'running' as const }
+                  set((s) => ({
+                    aiMessages: s.aiMessages.map(m => m.id === assistantId
+                      ? { ...m, agentSteps: [...(m.agentSteps || []), step] } : m)
+                  }))
+                } else if (data.type === 'tool_end') {
+                  set((s) => ({
+                    aiMessages: s.aiMessages.map(m => m.id === assistantId
+                      ? { ...m, agentSteps: (m.agentSteps || []).map(st => st.tool === data.tool && st.status === 'running' ? { ...st, output: data.output, status: 'success' as const } : st) } : m)
+                  }))
+                } else if (data.type === 'done') {
+                  updateAiMessage(assistantId, fullText, false)
+                  setAiLoading(false)
+                  const endTime = Date.now()
+                  set({ aiLastResponseTime: endTime - (get().aiResponseStartTime || endTime), aiResponseStartTime: null })
+                  ws.close()
+                  resolve(true)
+                } else if (data.type === 'error') {
+                  updateAiMessage(assistantId, `Sidecar error: ${data.message}`, false)
+                  setAiLoading(false)
+                  ws.close()
+                  resolve(true) // handled — don't fall through to direct
                 }
               }
-            }
-          } else if (settings.activeProvider === 'gemini') {
-            const res = await fetch(
-              `https://generativelanguage.googleapis.com/v1beta/models/${settings.geminiModel}:generateContent?key=${settings.geminiKey}`,
-              {
+
+              ws.onerror = () => {
+                if (!hasReceivedData) resolve(false)
+              }
+
+              // Timeout if sidecar is totally unresponsive
+              const timeout = setTimeout(() => { if (!hasReceivedData) { ws.close(); resolve(false) } }, 1500)
+            } catch { resolve(false) }
+          })
+        }
+
+        // ─── Fallback: Direct API Calls ────────────────────────────────────────
+        const runDirect = async () => {
+          try {
+            let fullText = ''
+            if (provider === 'groq') {
+              const groqModel = settings.groqModel || 'llama3-70b-8192'
+              const GROQ_MAX: Record<string, number> = {
+                'llama3-70b-8192': 8192, 'llama3-8b-8192': 8192,
+                'mixtral-8x7b-32768': 32768, 'gemma2-9b-it': 8192, 'default': 8192
+              }
+              const maxTokens = GROQ_MAX[groqModel] ?? GROQ_MAX['default']
+              const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${settings.groqKey}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: groqModel, stream: true, max_tokens: maxTokens,
+                  messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: text }]
+                })
+              })
+              const reader = res.body!.getReader(); const dec = new TextDecoder()
+              while (true) {
+                const { done, value } = await reader.read(); if (done) break
+                const chunk = dec.decode(value)
+                for (const line of chunk.split('\n')) {
+                  if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                    try {
+                      const d = JSON.parse(line.slice(6))
+                      fullText += d.choices?.[0]?.delta?.content || ''
+                      updateAiMessage(assistantId, fullText, true)
+                    } catch {}
+                  }
+                }
+              }
+            } else if (provider === 'ollama') {
+              // Use Native Bridge for Ollama Chat to avoid CORS
+              if (window.api && (window.api as any).ollamaChat) {
+                ;(window.api as any).removeOllamaListeners?.()
+                ;(window.api as any).onOllamaChunk?.((chunk: any) => {
+                  fullText += chunk.message?.content || ''
+                  updateAiMessage(assistantId, fullText, true)
+                })
+                ;(window.api as any).onOllamaDone?.(() => {
+                  updateAiMessage(assistantId, fullText, false)
+                  setAiLoading(false)
+                })
+                const res = await (window.api as any).ollamaChat(settings.ollamaHost, {
+                  model: settings.ollamaModel, stream: true,
+                  messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: text }]
+                })
+                if (!res.ok) {
+                  updateAiMessage(assistantId, `Ollama error: ${res.error}`, false)
+                  setAiLoading(false)
+                }
+                return
+              }
+              const res = await fetch(`${settings.ollamaHost}/api/chat`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: settings.ollamaModel, stream: true,
+                  messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: text }]
+                })
+              })
+              const reader = res.body!.getReader(); const dec = new TextDecoder()
+              while (true) {
+                const { done, value } = await reader.read(); if (done) break
+                const chunk = dec.decode(value)
+                for (const line of chunk.split('\n')) {
+                  if (line.trim()) {
+                    try { const d = JSON.parse(line); fullText += d.message?.content || ''; updateAiMessage(assistantId, fullText, true) } catch {}
+                  }
+                }
+              }
+            } else if (provider === 'gemini') {
+              const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${settings.geminiModel}:generateContent?key=${settings.geminiKey}`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   system_instruction: { parts: [{ text: systemPrompt }] },
-                  contents: [...history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-                    { role: 'user', parts: [{ text: text }] }]
+                  contents: [...history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })), { role: 'user', parts: [{ text: text }] }]
                 })
-              }
-            )
-            const data = await res.json()
-            fullText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response'
-          } else if (settings.activeProvider === 'claude') {
-            const res = await fetch('https://api.anthropic.com/v1/messages', {
-              method: 'POST',
-              headers: { 'x-api-key': settings.claudeKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: settings.claudeModel, max_tokens: 4096, stream: true,
-                system: systemPrompt,
-                messages: [...history, { role: 'user', content: text }]
               })
-            })
-            const reader = res.body!.getReader()
-            const dec = new TextDecoder()
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              const chunk = dec.decode(value)
-              for (const line of chunk.split('\n')) {
-                if (line.startsWith('data: ')) {
-                  try {
-                    const d = JSON.parse(line.slice(6))
-                    if (d.type === 'content_block_delta') {
-                      fullText += d.delta?.text || ''
-                      updateAiMessage(assistantId, fullText, true)
-                    }
-                  } catch {}
+              const data = await res.json()
+              fullText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response'
+            } else if (provider === 'claude') {
+              const res = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: { 'x-api-key': settings.claudeKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: settings.claudeModel || 'claude-sonnet-4-20250514',
+                  max_tokens: 4096, stream: true,
+                  system: systemPrompt,
+                  messages: [...history, { role: 'user', content: text }]
+                })
+              })
+              const reader = res.body!.getReader(); const dec = new TextDecoder()
+              while (true) {
+                const { done, value } = await reader.read(); if (done) break
+                const chunk = dec.decode(value)
+                for (const line of chunk.split('\n')) {
+                  if (line.startsWith('data: ')) {
+                    try {
+                      const d = JSON.parse(line.slice(6))
+                      if (d.type === 'content_block_delta') { fullText += d.delta?.text || ''; updateAiMessage(assistantId, fullText, true) }
+                    } catch {}
+                  }
                 }
               }
             }
-          } else if (settings.activeProvider === 'ollama') {
-            const res = await fetch(`${settings.ollamaHost}/api/chat`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: settings.ollamaModel, stream: true,
-                messages: [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: text }]
-              })
-            })
-            const reader = res.body!.getReader()
-            const dec = new TextDecoder()
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              const chunk = dec.decode(value)
-              for (const line of chunk.split('\n')) {
-                if (line.trim()) {
-                  try {
-                    const d = JSON.parse(line)
-                    fullText += d.message?.content || ''
-                    updateAiMessage(assistantId, fullText, true)
-                  } catch {}
-                }
+            updateAiMessage(assistantId, fullText, false)
+            const endTime = Date.now()
+            set({ aiLastResponseTime: endTime - (get().aiResponseStartTime || endTime), aiResponseStartTime: null })
+          } catch (e: any) {
+            updateAiMessage(assistantId, `Error: ${e.message}. Please check your connection or API keys.`, false)
+            set({ aiResponseStartTime: null })
+          } finally {
+            setAiLoading(false)
+          }
+        }
+
+        const success = await trySidecar()
+        if (!success) await runDirect()
+      },
+
+      fetchModels: async (provider) => {
+        const { settings, setAiError } = get()
+        try {
+          if (provider === 'ollama') {
+            // Use Native IPC Bridge to bypass CORS
+            if (window.api && window.api.getOllamaModels) {
+              const res = await window.api.getOllamaModels(settings.ollamaHost)
+              if (res.ok && res.models && res.models.length > 0) {
+                set((s) => ({ availableModels: { ...s.availableModels, ollama: res.models } }))
+                return
+              } else if (!res.ok) {
+                console.warn("Native Ollama fetch failed:", res.error)
               }
+            }
+
+            // Fallback 1: Try via Python sidecar
+            try {
+              const res = await fetch(`http://localhost:8765/models/ollama?host=${encodeURIComponent(settings.ollamaHost)}`)
+              const data = await res.json()
+              if (data.ok && data.models && data.models.length > 0) {
+                set((s) => ({ availableModels: { ...s.availableModels, ollama: data.models } }))
+                return
+              }
+            } catch {}
+
+            // Fallback 2: Direct (will likely fail CORS but good to have)
+            const res = await fetch(`${settings.ollamaHost}/api/tags`)
+            const data = await res.json()
+            const models = data.models?.map((m: any) => m.name) || []
+            if (models.length > 0) {
+              set((s) => ({ availableModels: { ...s.availableModels, ollama: models } }))
+            }
+          } else if (provider === 'groq' && settings.groqKey) {
+            const res = await fetch('https://api.groq.com/openai/v1/models', {
+              headers: { 'Authorization': `Bearer ${settings.groqKey}` }
+            })
+            const data = await res.json()
+            const models = data.data?.map((m: any) => m.id).sort() || []
+            if (models.length > 0) {
+              set((s) => ({ availableModels: { ...s.availableModels, groq: models } }))
+            }
+          } else if (provider === 'gemini' && settings.geminiKey) {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${settings.geminiKey}`)
+            const data = await res.json()
+            const models = data.models?.map((m: any) => m.name.replace('models/', '')).filter((m: string) => m.includes('gemini')) || []
+            if (models.length > 0) {
+              set((s) => ({ availableModels: { ...s.availableModels, gemini: models } }))
             }
           }
-
-          updateAiMessage(assistantId, fullText, false)
         } catch (e: any) {
-          updateAiMessage(assistantId, `Error: ${e.message}`, false)
-        } finally {
-          setAiLoading(false)
+          console.error(`Failed to fetch ${provider} models:`, e)
+          if (provider === 'ollama') setAiError(`Ollama Error: ${e.message}. Ensure Ollama is running.`)
         }
       },
 
@@ -471,11 +753,11 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
       },
 
       // ── Terminal actions ───────────────────────────────────────────────────
-      addTerminalTab: () => set((s) => {
+      addTerminalTab: (cwd?) => set((s) => {
         const id = `term_${Date.now()}`
         const name = `Terminal ${s.terminalTabs.length + 1}`
         return {
-          terminalTabs: [...s.terminalTabs, { id, name }],
+          terminalTabs: [...s.terminalTabs, { id, name, cwd: cwd || undefined }],
           activeTerminalTab: id,
         }
       }),
@@ -507,10 +789,16 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
       setCommandPaletteOpen: (b) => set({ commandPaletteOpen: b }),
 
       setInlineAi: (open, target = null) => set({ inlineAiOpen: open, inlineAiTarget: target }),
+
+      setEnhancerLoading: (enhancerLoading) => set({ enhancerLoading }),
     }),
     {
       name: 'codedroid-store',
-      partialize: (s) => ({ settings: s.settings, folderPath: s.folderPath }),
+      partialize: (s) => ({
+        settings: s.settings,
+        folderPath: s.folderPath,
+        availableModels: s.availableModels
+      }),
     }
   )
 )

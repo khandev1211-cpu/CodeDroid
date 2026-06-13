@@ -386,4 +386,36 @@ export function applyTheme(theme: Theme) {
     '--git-added': c.gitAdded, '--git-modified': c.gitModified, '--git-deleted': c.gitDeleted,
   }
   for (const [k, v] of Object.entries(map)) root.style.setProperty(k, v)
+
+  // Notify Monaco to re-apply theme (EditorArea listens to this event)
+  window.dispatchEvent(new CustomEvent('codedroid-theme-change', { detail: theme }))
+}
+
+/** Build an xterm.js ITheme from our Theme colors */
+export function getXtermTheme(theme: Theme) {
+  const c = theme.colors
+  return {
+    background: c.terminal,
+    foreground: c.termText,
+    cursor: c.accent,
+    cursorAccent: c.bg,
+    selectionBackground: c.selection + 'aa',
+    // ANSI colors — mapped to theme palette
+    black:        theme.category === 'light' ? '#24292f' : '#000000',
+    red:          c.gitDeleted,
+    green:        c.gitAdded,
+    yellow:       c.gitModified,
+    blue:         c.accent,
+    magenta:      c.keyword,
+    cyan:         c.type,
+    white:        c.text,
+    brightBlack:  c.textDim,
+    brightRed:    c.gitDeleted,
+    brightGreen:  c.gitAdded,
+    brightYellow: c.gitModified,
+    brightBlue:   c.accent,
+    brightMagenta:c.func,
+    brightCyan:   c.type,
+    brightWhite:  c.text,
+  }
 }

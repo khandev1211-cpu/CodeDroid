@@ -21,6 +21,16 @@ from pydantic import BaseModel
 app = FastAPI(title="CodeDroid AI Sidecar", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ─── Groq per-model token limits ─────────────────────────────────────────────
+GROQ_MAX_TOKENS = {
+    "llama3-70b-8192": 8192,
+    "llama3-8b-8192": 8192,
+    "mixtral-8x7b-32768": 32768,
+    "gemma2-9b-it": 8192,
+    "gemma-7b-it": 8192,
+    "default": 8192,
+}
+
 # ─── Models ──────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     messages: list[dict]
@@ -29,6 +39,8 @@ class ChatRequest(BaseModel):
     model: str = ""
     host: str = "http://localhost:11434"
     system: str = ""
+    mode: str = "ask"
+    skills: list[str] = []
 
 class ToolRequest(BaseModel):
     tool: str
@@ -210,38 +222,40 @@ TOOLS = [
 async def execute_tool(tool_name: str, args: dict) -> str:
     try:
         if tool_name == "read_file":
-            p = Path(args["path"])
+            p = Path(_resolve_path(args["path"]))
             return p.read_text(encoding="utf-8") if p.exists() else f"Error: File not found: {args['path']}"
 
         elif tool_name == "write_file" or tool_name == "create_file":
-            p = Path(args["path"])
+            p = Path(_resolve_path(args["path"]))
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(args.get("content", ""), encoding="utf-8")
-            return f"Written: {args['path']}"
+            return f"Written: {p}"
 
         elif tool_name == "delete_file":
             import shutil
-            p = Path(args["path"])
+            p = Path(_resolve_path(args["path"]))
             if p.is_dir(): shutil.rmtree(p)
             elif p.exists(): p.unlink()
-            return f"Deleted: {args['path']}"
+            return f"Deleted: {p}"
 
         elif tool_name == "make_dir":
-            Path(args["path"]).mkdir(parents=True, exist_ok=True)
-            return f"Created directory: {args['path']}"
+            p = Path(_resolve_path(args["path"]))
+            p.mkdir(parents=True, exist_ok=True)
+            return f"Created directory: {p}"
 
         elif tool_name == "list_files":
-            p = Path(args["path"])
-            if not p.exists(): return f"Error: Directory not found"
+            p = Path(_resolve_path(args["path"]))
+            if not p.exists(): return f"Error: Directory not found: {args['path']}"
             entries = []
             for e in sorted(p.iterdir()):
                 entries.append(f"{'[DIR]' if e.is_dir() else '[FILE]'} {e.name}")
             return "\n".join(entries) or "(empty)"
 
         elif tool_name == "run_command":
+            cwd = _resolve_path(args.get("cwd", "")) or _workspace_root or None
             result = subprocess.run(
                 args["command"], shell=True, capture_output=True, text=True,
-                cwd=args.get("cwd") or None, timeout=30
+                cwd=cwd, timeout=30
             )
             out = result.stdout + result.stderr
             return out[:4000] if out else "(no output)"
@@ -252,9 +266,10 @@ async def execute_tool(tool_name: str, args: dict) -> str:
                 f.write(args["code"])
                 tmp = f.name
             try:
+                cwd = _resolve_path(args.get("cwd", "")) or _workspace_root or None
                 result = subprocess.run(
                     [sys.executable, tmp], capture_output=True, text=True,
-                    cwd=args.get("cwd") or None, timeout=30
+                    cwd=cwd, timeout=30
                 )
                 return (result.stdout + result.stderr)[:4000] or "(no output)"
             finally:
@@ -268,9 +283,10 @@ async def execute_tool(tool_name: str, args: dict) -> str:
             return (result.stdout + result.stderr)[:2000]
 
         elif tool_name == "git_command":
+            cwd = _resolve_path(args.get("cwd", "")) or _workspace_root or None
             result = subprocess.run(
                 ["git"] + args["args"], capture_output=True, text=True,
-                cwd=args.get("cwd") or None, timeout=30
+                cwd=cwd, timeout=30
             )
             return (result.stdout + result.stderr)[:2000]
 
@@ -286,9 +302,44 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
 
 # ─── REST endpoints ────────────────────────────────────────────────────────────
+
+# Global workspace root — updated by /set-workspace when user opens a folder
+_workspace_root: str = ""
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "3.0.0"}
+
+
+@app.post("/set-workspace")
+async def set_workspace(body: dict):
+    global _workspace_root
+    _workspace_root = body.get("path", "")
+    return {"ok": True, "workspace": _workspace_root}
+
+
+def _resolve_path(p: str) -> str:
+    """Resolve a path against the workspace root if it is relative."""
+    if not p:
+        return p
+    path = Path(p)
+    if path.is_absolute():
+        return str(path)
+    if _workspace_root:
+        return str(Path(_workspace_root) / path)
+    return str(path.resolve())
+
+
+@app.get("/models/ollama")
+async def get_ollama_models(host: str = "http://localhost:11434"):
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{host}/api/tags")
+            data = r.json()
+            models = [m["name"] for m in data.get("models", [])]
+            return {"ok": True, "models": models}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/tool")
@@ -324,6 +375,97 @@ async def lint_code(req: LintRequest):
         return {"ok": False, "error": str(e)}
 
 
+# ─── Skill Resolver ──────────────────────────────────────────────────────────
+SKILLS_WORKSPACE = r"C:\Users\CHAND COMPUTER\Desktop\WOrkSpace\SkillsForAi"
+
+def get_skill_content(skill_id: str) -> str:
+    # Try local first, then workspace
+    search_paths = [
+        Path(__file__).parent / "skills" / f"{skill_id}.json",
+        Path(SKILLS_WORKSPACE) / "agents" / "skills" / skill_id / "SKILL.md",
+        Path(SKILLS_WORKSPACE) / "claude" / "skills" / skill_id / "SKILL.md",
+    ]
+
+    for p in search_paths:
+        if p.exists():
+            if p.suffix == ".json":
+                data = json.loads(p.read_text(encoding="utf-8"))
+                return data.get("systemPromptBlock", "")
+            else:
+                return f"\n--- SKILL: {skill_id} ---\n{p.read_text(encoding='utf-8')}\n"
+    return ""
+
+@app.get("/skills/list")
+async def list_skills():
+    skills = []
+    base = Path(SKILLS_WORKSPACE) / "agents" / "skills"
+    if base.exists():
+        for d in base.iterdir():
+            if d.is_dir() and (d / "SKILL.md").exists():
+                skills.append({"id": d.name, "path": str(d / "SKILL.md")})
+    return {"skills": skills}
+
+@app.post("/enhance")
+async def enhance_prompt(req: ChatRequest):
+    system_instruction = (
+        "You are an expert prompt engineer. Rewrite the user's rough prompt to be "
+        "clear, detailed, and optimized for AI while preserving the original intent. "
+        "Return ONLY the enhanced prompt text."
+    )
+
+    prompt = req.messages[0]["content"] if req.messages else ""
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            if req.provider == "groq":
+                enh_model = req.model or "llama3-70b-8192"
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {req.api_key}"},
+                    json={
+                        "model": enh_model,
+                        "max_tokens": GROQ_MAX_TOKENS.get(enh_model, GROQ_MAX_TOKENS["default"]),
+                        "messages": [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}],
+                    }
+                )
+                return {"enhanced": r.json()["choices"][0]["message"]["content"]}
+
+            elif req.provider == "ollama":
+                r = await client.post(
+                    f"{req.host}/api/chat",
+                    json={
+                        "model": req.model or "llama3",
+                        "stream": False,
+                        "messages": [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
+                    }
+                )
+                return {"enhanced": r.json()["message"]["content"]}
+
+            elif req.provider == "gemini":
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{req.model or 'gemini-1.5-pro'}:generateContent?key={req.api_key}",
+                    json={"contents": [{"parts": [{"text": f"{system_instruction}\n\nPrompt to enhance: {prompt}"}]}]}
+                )
+                return {"enhanced": r.json()["candidates"][0]["content"]["parts"][0]["text"]}
+
+            elif req.provider == "claude":
+                r = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={
+                        "model": req.model or "claude-3-5-sonnet-20240620",
+                        "max_tokens": 1024,
+                        "system": system_instruction,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }
+                )
+                return {"enhanced": r.json()["content"][0]["text"]}
+
+            return {"enhanced": prompt}
+    except Exception as e:
+        print(f"Enhance Error: {e}")
+        return {"enhanced": prompt, "error": str(e)}
+
 # ─── WebSocket streaming AI ───────────────────────────────────────────────────
 @app.websocket("/ws/chat")
 async def websocket_chat(ws: WebSocket):
@@ -333,92 +475,269 @@ async def websocket_chat(ws: WebSocket):
             data = await ws.receive_text()
             req = ChatRequest(**json.loads(data))
 
+            # Dynamic Skill Injection
+            skill_blocks = []
+            for skill_id in req.skills:
+                content = get_skill_content(skill_id)
+                if content:
+                    skill_blocks.append(content)
+
+            skill_context = "\n".join(skill_blocks)
+
             system = req.system or (
                 "You are CodeDroid AI Copilot, an expert coding assistant. "
                 "Be concise, technical, and precise. Format code with markdown."
             )
 
+            if skill_context:
+                system = f"{system}\n\nUSE THESE SPECIALIZED SKILLS AND RULES:\n{skill_context}"
+
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                # Tool descriptions for prompt-injection providers (Ollama, Gemini)
+                TOOLS_DESCRIPTION = "\n".join(
+                    f"- {t['function']['name']}: {t['function']['description']}"
+                    for t in TOOLS
+                )
+                AGENT_TOOL_PROMPT = (
+                    "\n\nYou have access to the following tools. To call a tool, output ONLY a "
+                    "JSON object on its own line in this exact format (no markdown, no backticks):\n"
+                    '{"tool":"<name>","args":{<args>}}\n'
+                    "After each tool call you will receive a [TOOL RESULT] message. "
+                    "Continue calling tools as needed. When fully done, output your final answer.\n\n"
+                    f"Available tools:\n{TOOLS_DESCRIPTION}"
+                )
+
+                async with httpx.AsyncClient(timeout=120) as client:
+
                     if req.provider == "groq":
-                        async with client.stream(
-                            "POST",
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {req.api_key}"},
-                            json={
-                                "model": req.model or "llama3-70b-8192",
+                        # ── Groq: native function-calling agent loop ─────────────────────
+                        current_messages = [{"role": "system", "content": system}] + req.messages
+                        max_iterations = 8 if req.mode == "agent" else 1
+                        groq_model = req.model or "llama3-70b-8192"
+                        groq_max_tokens = GROQ_MAX_TOKENS.get(groq_model, GROQ_MAX_TOKENS["default"])
+
+                        for i in range(max_iterations):
+                            payload: dict = {
+                                "model": groq_model,
                                 "stream": True,
-                                "messages": [{"role": "system", "content": system}] + req.messages,
-                            },
-                        ) as resp:
-                            async for line in resp.aiter_lines():
-                                if line.startswith("data: ") and line != "data: [DONE]":
-                                    try:
-                                        chunk = json.loads(line[6:])
-                                        token = chunk["choices"][0]["delta"].get("content", "")
-                                        if token:
-                                            await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                    except: pass
+                                "max_tokens": groq_max_tokens,
+                                "messages": current_messages,
+                            }
+                            if req.mode == "agent":
+                                payload["tools"] = TOOLS
+                                payload["tool_choice"] = "auto"
+
+                            tool_calls: list = []
+                            full_content = ""
+                            async with client.stream(
+                                "POST", "https://api.groq.com/openai/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {req.api_key}"},
+                                json=payload,
+                            ) as resp:
+                                async for line in resp.aiter_lines():
+                                    if line.startswith("data: ") and line != "data: [DONE]":
+                                        try:
+                                            chunk = json.loads(line[6:])
+                                            delta = chunk["choices"][0]["delta"]
+                                            if "content" in delta and delta["content"]:
+                                                full_content += delta["content"]
+                                                await ws.send_text(json.dumps({"type": "token", "text": delta["content"]}))
+                                            if "tool_calls" in delta:
+                                                for tc in delta["tool_calls"]:
+                                                    while len(tool_calls) <= tc["index"]:
+                                                        tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                                    if "id" in tc: tool_calls[tc["index"]]["id"] += tc["id"]
+                                                    if "function" in tc:
+                                                        if "name" in tc["function"]: tool_calls[tc["index"]]["function"]["name"] += tc["function"]["name"]
+                                                        if "arguments" in tc["function"]: tool_calls[tc["index"]]["function"]["arguments"] += tc["function"]["arguments"]
+                                        except: pass
+
+                            if not tool_calls:
+                                break
+
+                            current_messages.append({"role": "assistant", "content": full_content, "tool_calls": tool_calls})
+                            for tc in tool_calls:
+                                name = tc["function"]["name"]
+                                try:
+                                    args = json.loads(tc["function"]["arguments"])
+                                except Exception:
+                                    args = {}
+                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
+                                result = await execute_tool(name, args)
+                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
+                                current_messages.append({
+                                    "role": "tool", "tool_call_id": tc["id"],
+                                    "name": name, "content": result,
+                                })
+                            if i == max_iterations - 1:
+                                await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
 
                     elif req.provider == "claude":
-                        async with client.stream(
-                            "POST",
-                            "https://api.anthropic.com/v1/messages",
-                            headers={
-                                "x-api-key": req.api_key,
-                                "anthropic-version": "2023-06-01",
-                                "content-type": "application/json",
-                            },
-                            json={
-                                "model": req.model or "claude-sonnet-4-20250514",
-                                "max_tokens": 4096,
-                                "stream": True,
-                                "system": system,
-                                "messages": req.messages,
-                            },
-                        ) as resp:
-                            async for line in resp.aiter_lines():
-                                if line.startswith("data: "):
-                                    try:
-                                        chunk = json.loads(line[6:])
-                                        if chunk.get("type") == "content_block_delta":
-                                            token = chunk["delta"].get("text", "")
-                                            if token:
-                                                await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                    except: pass
+                        # ── Claude: native tool_use API ──────────────────────────────────
+                        claude_model = req.model or "claude-sonnet-4-20250514"
+
+                        if req.mode == "agent":
+                            claude_tools = [
+                                {"name": t["function"]["name"],
+                                 "description": t["function"]["description"],
+                                 "input_schema": t["function"]["parameters"]}
+                                for t in TOOLS
+                            ]
+                            current_messages = list(req.messages)
+                            max_iterations = 8
+
+                            for i in range(max_iterations):
+                                r = await client.post(
+                                    "https://api.anthropic.com/v1/messages",
+                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                    json={
+                                        "model": claude_model, "max_tokens": 4096,
+                                        "system": system, "tools": claude_tools,
+                                        "tool_choice": {"type": "auto"},
+                                        "messages": current_messages,
+                                    },
+                                )
+                                resp_data = r.json()
+                                stop_reason = resp_data.get("stop_reason", "")
+                                content_blocks = resp_data.get("content", [])
+
+                                for block in content_blocks:
+                                    if block.get("type") == "text" and block.get("text"):
+                                        await ws.send_text(json.dumps({"type": "token", "text": block["text"]}))
+
+                                if stop_reason != "tool_use":
+                                    break
+
+                                tool_results = []
+                                for block in content_blocks:
+                                    if block.get("type") == "tool_use":
+                                        name = block["name"]
+                                        args = block.get("input", {})
+                                        tool_id = block.get("id", "")
+                                        await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
+                                        result = await execute_tool(name, args)
+                                        await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
+                                        tool_results.append({"type": "tool_result", "tool_use_id": tool_id, "content": result})
+
+                                current_messages.append({"role": "assistant", "content": content_blocks})
+                                current_messages.append({"role": "user", "content": tool_results})
+                                if i == max_iterations - 1:
+                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
+                        else:
+                            async with client.stream(
+                                "POST", "https://api.anthropic.com/v1/messages",
+                                headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                json={"model": claude_model, "max_tokens": 4096, "stream": True, "system": system, "messages": req.messages},
+                            ) as resp:
+                                async for line in resp.aiter_lines():
+                                    if line.startswith("data: "):
+                                        try:
+                                            chunk = json.loads(line[6:])
+                                            if chunk.get("type") == "content_block_delta":
+                                                token = chunk["delta"].get("text", "")
+                                                if token:
+                                                    await ws.send_text(json.dumps({"type": "token", "text": token}))
+                                        except: pass
 
                     elif req.provider == "ollama":
-                        async with client.stream(
-                            "POST",
-                            f"{req.host}/api/chat",
-                            json={
-                                "model": req.model or "llama3",
-                                "stream": True,
-                                "messages": [{"role": "system", "content": system}] + req.messages,
-                            },
-                        ) as resp:
-                            async for line in resp.aiter_lines():
-                                if line.strip():
-                                    try:
-                                        chunk = json.loads(line)
-                                        token = chunk.get("message", {}).get("content", "")
-                                        if token:
-                                            await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                    except: pass
+                        # ── Ollama: prompt-injection agent loop ──────────────────────────
+                        ollama_model = req.model or "llama3"
+
+                        if req.mode == "agent":
+                            agent_system = system + AGENT_TOOL_PROMPT
+                            current_messages = [{"role": "system", "content": agent_system}] + req.messages
+                            max_iterations = 8
+                            for i in range(max_iterations):
+                                r = await client.post(
+                                    f"{req.host}/api/chat",
+                                    json={"model": ollama_model, "stream": False, "messages": current_messages},
+                                )
+                                reply = r.json().get("message", {}).get("content", "")
+                                current_messages.append({"role": "assistant", "content": reply})
+                                tool_called = False
+                                for ln in reply.splitlines():
+                                    ln = ln.strip()
+                                    if ln.startswith("{") and '"tool"' in ln:
+                                        try:
+                                            call = json.loads(ln)
+                                            name = call.get("tool", "")
+                                            args = call.get("args", {})
+                                            if name:
+                                                tool_called = True
+                                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
+                                                result = await execute_tool(name, args)
+                                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
+                                                current_messages.append({"role": "user", "content": f"[TOOL RESULT for {name}]\n{result}"})
+                                        except: pass
+                                if not tool_called:
+                                    await ws.send_text(json.dumps({"type": "token", "text": reply}))
+                                    break
+                                if i == max_iterations - 1:
+                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
+                        else:
+                            async with client.stream(
+                                "POST", f"{req.host}/api/chat",
+                                json={"model": ollama_model, "stream": True,
+                                      "messages": [{"role": "system", "content": system}] + req.messages},
+                            ) as resp:
+                                async for line in resp.aiter_lines():
+                                    if line.strip():
+                                        try:
+                                            chunk = json.loads(line)
+                                            token = chunk.get("message", {}).get("content", "")
+                                            if token:
+                                                await ws.send_text(json.dumps({"type": "token", "text": token}))
+                                        except: pass
 
                     else:  # gemini
-                        r = await client.post(
-                            f"https://generativelanguage.googleapis.com/v1beta/models/{req.model or 'gemini-1.5-pro'}:generateContent",
-                            params={"key": req.api_key},
-                            json={
-                                "system_instruction": {"parts": [{"text": system}]},
-                                "contents": req.messages,
-                            },
-                        )
-                        data = r.json()
-                        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                        if text:
-                            await ws.send_text(json.dumps({"type": "token", "text": text}))
+                        # ── Gemini: prompt-injection agent loop ──────────────────────────
+                        gemini_model = req.model or "gemini-1.5-pro"
+
+                        if req.mode == "agent":
+                            agent_system = system + AGENT_TOOL_PROMPT
+                            gemini_messages = list(req.messages)
+                            max_iterations = 8
+                            for i in range(max_iterations):
+                                r = await client.post(
+                                    f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
+                                    params={"key": req.api_key},
+                                    json={
+                                        "system_instruction": {"parts": [{"text": agent_system}]},
+                                        "contents": gemini_messages,
+                                    },
+                                )
+                                reply = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                gemini_messages.append({"role": "model", "parts": [{"text": reply}]})
+                                tool_called = False
+                                for ln in reply.splitlines():
+                                    ln = ln.strip()
+                                    if ln.startswith("{") and '"tool"' in ln:
+                                        try:
+                                            call = json.loads(ln)
+                                            name = call.get("tool", "")
+                                            args = call.get("args", {})
+                                            if name:
+                                                tool_called = True
+                                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
+                                                result = await execute_tool(name, args)
+                                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
+                                                gemini_messages.append({"role": "user", "parts": [{"text": f"[TOOL RESULT for {name}]\n{result}"}]})
+                                        except: pass
+                                if not tool_called:
+                                    await ws.send_text(json.dumps({"type": "token", "text": reply}))
+                                    break
+                                if i == max_iterations - 1:
+                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
+                        else:
+                            r = await client.post(
+                                f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
+                                params={"key": req.api_key},
+                                json={"system_instruction": {"parts": [{"text": system}]}, "contents": req.messages},
+                            )
+                            data = r.json()
+                            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                            if text:
+                                await ws.send_text(json.dumps({"type": "token", "text": text}))
 
                 await ws.send_text(json.dumps({"type": "done"}))
 

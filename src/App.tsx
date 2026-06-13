@@ -15,13 +15,23 @@ export default function App() {
   const {
     settings, theme, commandPaletteOpen,
     setCommandPaletteOpen, saveAllFiles, applyThemeById,
-    updateSettings, openFiles, activeFileIndex, saveFile
+    updateSettings, openFiles, activeFileIndex, saveFile,
+    fetchModels // Added fetchModels
   } = useStore()
 
-  // Apply saved theme on startup
+  // Apply saved theme and auto-fetch models on startup
   useEffect(() => {
     const saved = themes.find(t => t.id === settings.themeId) || themes[0]
     applyTheme(saved)
+
+    // Auto-fetch models with a slight delay to allow sidecar to boot
+    const timer = setTimeout(() => {
+      fetchModels('ollama')
+      if (settings.groqKey) fetchModels('groq')
+      if (settings.geminiKey) fetchModels('gemini')
+    }, 3000)
+
+    return () => clearTimeout(timer)
   }, [])
 
   // Global keyboard shortcuts

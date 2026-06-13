@@ -1,43 +1,84 @@
-.files-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+/* ── Panel layout ─────────────────────────────────────────────────────────── */
+.files-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; outline: none; }
 .files-content { flex: 1; overflow-y: auto; }
 .tree-root { padding: 4px 0; }
 .tree-folder-name {
   font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
   text-transform: uppercase; color: var(--text-muted);
-  padding: 6px 12px 4px;
+  padding: 6px 12px 4px; user-select: none;
 }
+
+/* ── Tree items ───────────────────────────────────────────────────────────── */
 .tree-item {
   display: flex; align-items: center; gap: 5px; height: 22px;
   cursor: pointer; font-size: 13px; color: var(--text-muted);
   border-radius: 0; position: relative; transition: background 0.05s;
-  white-space: nowrap; overflow: hidden;
+  white-space: nowrap; overflow: hidden; user-select: none; outline: none;
 }
-.tree-item:hover { background: var(--bg-hover); color: var(--text); }
-.tree-item.active { background: var(--bg-active); color: var(--text); }
+.tree-item:hover  { background: var(--bg-hover);   color: var(--text); }
+.tree-item.active { background: var(--bg-active);  color: var(--text); }
+.tree-item:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 .tree-arrow { display: flex; align-items: center; flex-shrink: 0; color: var(--text-dim); }
-.tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.tree-name  { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Inline input (create / rename) ──────────────────────────────────────── */
+.inline-input-wrap {
+  display: flex; align-items: flex-start; gap: 5px;
+  padding: 2px 8px; min-height: 22px;
+}
+.inline-input-col { display: flex; flex-direction: column; flex: 1; gap: 2px; }
 .tree-rename-input {
-  flex: 1; background: var(--bg-input); border: 1px solid var(--accent);
+  flex: 1; width: 100%;
+  background: var(--bg-input); border: 1px solid var(--accent);
   color: var(--text); font-size: 13px; font-family: inherit;
   padding: 1px 4px; border-radius: 2px; outline: none;
 }
-.git-badge {
-  font-size: 10px; font-weight: 600; flex-shrink: 0; padding-right: 8px;
+.tree-rename-input.input-err { border-color: var(--git-deleted); }
+.inline-error {
+  font-size: 11px; color: var(--git-deleted); padding: 1px 2px;
+  line-height: 1.3;
 }
-.fi-dir { color: var(--accent); flex-shrink: 0; }
-.fi-code { color: var(--syn-func); flex-shrink: 0; }
-.fi-text { color: var(--syn-string); flex-shrink: 0; }
-.fi-file { color: var(--text-dim); flex-shrink: 0; }
 
-.ctx-menu {
-  position: absolute; right: 8px; z-index: 100; background: var(--bg-panel);
-  border: 1px solid var(--border); border-radius: var(--radius);
-  box-shadow: 0 4px 20px rgba(0,0,0,0.4); min-width: 140px; padding: 4px;
+/* ── Context menu ─────────────────────────────────────────────────────────── */
+.ctx-menu-v2 {
+  position: fixed; z-index: 9999;
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  min-width: 220px; padding: 4px 0; user-select: none;
 }
-.ctx-item {
+.ctx-item-v2 {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; border-radius: var(--radius-sm);
-  font-size: 12px; cursor: pointer; color: var(--text-muted);
+  padding: 5px 12px; font-size: 12.5px; cursor: pointer;
+  color: var(--text-muted); transition: background 0.05s;
 }
-.ctx-item:hover { background: var(--bg-hover); color: var(--text); }
-.ctx-item.danger:hover { background: rgba(241,76,76,0.1); color: var(--git-deleted); }
+.ctx-item-v2:hover { background: var(--bg-hover); color: var(--text); }
+.ctx-item-v2.danger:hover { background: rgba(241,76,76,0.12); color: var(--git-deleted); }
+.ctx-icon     { width: 16px; text-align: center; flex-shrink: 0; font-size: 12px; }
+.ctx-label    { flex: 1; }
+.ctx-shortcut { font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
+.ctx-sep { height: 1px; background: var(--border-light); margin: 3px 0; }
+
+/* ── File icons ───────────────────────────────────────────────────────────── */
+.fi-dir  { color: var(--accent);       flex-shrink: 0; }
+.fi-code { color: var(--syn-func);     flex-shrink: 0; }
+.fi-text { color: var(--syn-string);   flex-shrink: 0; }
+.fi-file { color: var(--text-dim);     flex-shrink: 0; }
+
+/* ── Git badges ───────────────────────────────────────────────────────────── */
+.git-badge { font-size: 10px; font-weight: 600; flex-shrink: 0; padding-right: 8px; }
+
+/* ── Toast notifications ──────────────────────────────────────────────────── */
+.toast-stack {
+  position: fixed; bottom: 32px; right: 16px;
+  display: flex; flex-direction: column; gap: 6px;
+  z-index: 99999; pointer-events: none;
+}
+.toast {
+  padding: 8px 14px; border-radius: var(--radius);
+  font-size: 12.5px; font-weight: 500; max-width: 320px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  animation: toast-in 0.18s ease;
+}
+.toast-ok  { background: var(--bg-panel); border: 1px solid var(--git-added);   color: var(--git-added); }
+.toast-err { background: var(--bg-panel); border: 1px solid var(--git-deleted); color: var(--git-deleted); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }

@@ -1,9 +1,16 @@
-import { useState, useRef, useEffect } from "react"
+import { useState, useRef, useEffect, useCallback } from "react"
 import {
   Bot, Send, Trash2, Copy, Loader2, Zap, CheckCheck,
-  ChevronDown, RefreshCw, Sparkles
+  ChevronDown, RefreshCw, Sparkles, Map, History,
+  Play, Pause, Square, ChevronRight, Wrench
 } from "lucide-react"
-import { useStore, AiProvider } from "../../stores/appStore"
+import { useStore, AiProvider, AiMessage, PlanStep, AgentStep } from "../../stores/appStore"
+import { useHistoryStore } from "../../stores/historyStore"
+import { detectSkills, buildSystemPrompt } from "./SkillEngine"
+import { Skill } from "../../skills/skillRegistry"
+import ChatModeSelector from "./ChatModeSelector"
+import PromptEnhancer from "./PromptEnhancer"
+import HistoryPanel from "./HistoryPanel"
 import "./AiPanel.css"
 
 // ── Provider config ─────────────────────────────────────────────────────────
@@ -12,12 +19,6 @@ const PROVIDER_COLORS: Record<AiProvider, string> = {
 }
 const PROVIDER_LABELS: Record<AiProvider, string> = {
   groq: "Groq", gemini: "Gemini", ollama: "Ollama", claude: "Claude"
-}
-const STATIC_MODELS: Record<AiProvider, string[]> = {
-  groq:   ["llama3-70b-8192","llama3-8b-8192","mixtral-8x7b-32768","gemma2-9b-it","llama-3.1-70b-versatile","llama-3.3-70b-versatile"],
-  gemini: ["gemini-1.5-pro","gemini-1.5-flash","gemini-2.0-flash","gemini-2.0-flash-lite"],
-  claude: ["claude-sonnet-4-20250514","claude-opus-4-5","claude-haiku-4-5-20251001","claude-3-5-sonnet-20241022"],
-  ollama: [],
 }
 
 const SLASH_COMMANDS = [
@@ -30,49 +31,6 @@ const SLASH_COMMANDS = [
   { cmd: "/review",   desc: "Code review with suggestions" },
   { cmd: "/types",    desc: "Add TypeScript types" },
 ]
-
-async function fetchModels(
-  provider: AiProvider, apiKey: string, host: string,
-  onError?: (msg: string) => void
-): Promise<string[]> {
-  try {
-    if (provider === "groq") {
-      if (!apiKey) { onError?.("No Groq API key — add it in Settings → AI"); return STATIC_MODELS.groq }
-      const res = await fetch("https://api.groq.com/openai/v1/models", {
-        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" }
-      })
-      if (!res.ok) { onError?.(`Groq error ${res.status}: ${res.statusText}`); return STATIC_MODELS.groq }
-      const data = await res.json()
-      const models = data.data?.map((m: any) => m.id).sort() || []
-      if (!models.length) { onError?.("Groq returned 0 models"); return STATIC_MODELS.groq }
-      return models
-    }
-    if (provider === "ollama") {
-      const res = await fetch(`${host}/api/tags`).catch(() => null)
-      if (!res) { onError?.(`Cannot reach Ollama at ${host} — is it running?`); return [] }
-      const data = await res.json()
-      const models = data.models?.map((m: any) => m.name) || []
-      if (!models.length) { onError?.("Ollama is running but no models found — run: ollama pull llama3") }
-      return models
-    }
-    if (provider === "gemini") {
-      if (!apiKey) { onError?.("No Gemini API key — add it in Settings → AI"); return STATIC_MODELS.gemini }
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`)
-      if (!res.ok) { onError?.(`Gemini error ${res.status}: ${res.statusText}`); return STATIC_MODELS.gemini }
-      const data = await res.json()
-      const models = data.models?.map((m: any) => m.name.replace("models/","")).filter((m: string) => m.includes("gemini")) || []
-      return models.length ? models : STATIC_MODELS.gemini
-    }
-    if (provider === "claude") {
-      if (!apiKey) { onError?.("No Claude API key — add it in Settings → AI"); return STATIC_MODELS.claude }
-      // Anthropic has no public list endpoint — use curated static list
-      return STATIC_MODELS.claude
-    }
-  } catch (e: any) {
-    onError?.(`Fetch failed: ${e.message}`)
-  }
-  return STATIC_MODELS[provider] || []
-}
 
 function renderMarkdown(text: string) {
   return text
@@ -88,40 +46,207 @@ function renderMarkdown(text: string) {
     .replace(/\n\n/g,"</p><p>")
 }
 
-function MessageBubble({ msg }: { msg: any }) {
+function MessageBubble({ msg, onExecutePlan }: { msg: AiMessage; onExecutePlan?: (id: string) => void }) {
   const isUser = msg.role === "user"
   const [copied, setCopied] = useState(false)
+  const [displayedContent, setDisplayedContent] = useState("")
+  const targetRef = useRef(msg.content)
+  targetRef.current = msg.content
+
+  useEffect(() => {
+    // Determine if we should animate: only animate fresh messages (< 2.5 seconds old) or currently streaming ones.
+    const age = Date.now() - msg.timestamp
+    const shouldAnimate = !isUser && (msg.isStreaming || age < 2500)
+
+    if (!shouldAnimate) {
+      setDisplayedContent(msg.content)
+      return
+    }
+
+    const interval = setInterval(() => {
+      setDisplayedContent((current) => {
+        const target = targetRef.current
+        if (current.length >= target.length) {
+          return target
+        }
+
+        // Dynamically adjust typing step size depending on how far behind the stream we are
+        const remaining = target.length - current.length
+        let step = 1
+        if (remaining > 300) step = 25
+        else if (remaining > 150) step = 12
+        else if (remaining > 60) step = 6
+        else if (remaining > 20) step = 3
+        else if (remaining > 5) step = 2
+
+        return target.slice(0, current.length + step)
+      })
+    }, 12)
+
+    return () => clearInterval(interval)
+  }, [isUser, msg.timestamp])
+
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(()=>setCopied(false),1500) }
+
   return (
     <div className={`msg-wrap ${isUser?"user":"assistant"}`}>
       <div className={`msg-bubble ${isUser?"msg-user":"msg-ai"}`}>
         {!isUser && (
           <div className="msg-header">
-            <span className="provider-badge" style={{ color: PROVIDER_COLORS[msg.provider as AiProvider] }}>
-              {PROVIDER_LABELS[msg.provider as AiProvider] || msg.provider}
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span className="provider-badge" style={{ color: PROVIDER_COLORS[msg.provider] }}>
+                {PROVIDER_LABELS[msg.provider] || msg.provider}
+              </span>
+              {msg.mode && (
+                <span className={`mode-pill ${msg.mode}`}>
+                  {msg.mode === 'plan' ? '🗺️ Plan' : msg.mode === 'agent' ? '🤖 Agent' : '💬 Ask'}
+                </span>
+              )}
+            </div>
             <button className="icon-btn" style={{width:20,height:20}} onClick={copy}>
               {copied ? <CheckCheck size={11} style={{color:"var(--git-added)"}} /> : <Copy size={11} />}
             </button>
           </div>
         )}
+
+        {/* Skills applied */}
+        {msg.appliedSkills && msg.appliedSkills.length > 0 && (
+          <div className="msg-skills">
+            {msg.appliedSkills.map(s => <span key={s} className="skill-tag">🔧 {s}</span>)}
+          </div>
+        )}
+
         {isUser
           ? <div className="msg-text">{msg.content}</div>
-          : <div className="msg-md" dangerouslySetInnerHTML={{__html: renderMarkdown(msg.content)}} />}
+          : (
+            <>
+              <div className="msg-md" dangerouslySetInnerHTML={{__html: renderMarkdown(displayedContent)}} />
+
+              {/* Plan Steps - Interactive Cards */}
+              {msg.planSteps && msg.planSteps.length > 0 && (
+                <div className="plan-steps-container">
+                  <div className="plan-header-title">Implementation Plan</div>
+                  {msg.planSteps.map((step, idx) => (
+                    <div key={step.id} className={`plan-step-card ${step.status || 'pending'}`}>
+                      <div className="step-num">{idx + 1}</div>
+                      <div className="step-content">
+                        <div className="step-row">
+                          <span className="step-title">{step.title}</span>
+                          <span className="step-complexity">{step.estimatedComplexity}</span>
+                        </div>
+                        <div className="step-description">{step.description}</div>
+                        {step.result && <div className="step-result-bubble">{step.result}</div>}
+                      </div>
+                      <div className="step-status-icon">
+                        {step.status === 'completed' && <CheckCheck size={14} style={{color: 'var(--git-added)'}} />}
+                        {step.status === 'running' && <Loader2 size={14} className="spin" style={{color: 'var(--accent)'}} />}
+                      </div>
+                    </div>
+                  ))}
+                  {msg.mode === 'plan' && !msg.isStreaming && !msg.planSteps.some(s => s.status === 'completed' || s.status === 'running') && (
+                    <button className="execute-plan-btn" onClick={() => onExecutePlan?.(msg.id)}>
+                      <Play size={12} fill="currentColor" />
+                      <span>Execute this plan</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Agent Tool Logs */}
+              {msg.agentSteps && msg.agentSteps.length > 0 && (
+                <div className="agent-logs">
+                  <div className="logs-header">Agent Actions</div>
+                  {msg.agentSteps.map(step => (
+                    <details key={step.id} className={`agent-log-entry ${step.status}`}>
+                      <summary>
+                        <div className="log-summary">
+                          <Zap size={10} />
+                          <span className="log-tool">{step.tool}</span>
+                          <span className="log-status">{step.status}</span>
+                        </div>
+                      </summary>
+                      <div className="log-details">
+                        <div className="log-label">Input:</div>
+                        <pre className="log-code">{step.input}</pre>
+                        {step.output && (
+                          <>
+                            <div className="log-label">Output:</div>
+                            <pre className="log-code">{step.output}</pre>
+                          </>
+                        )}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
         {msg.isStreaming && <span className="streaming-cursor">▋</span>}
       </div>
     </div>
   )
 }
 
+function BeautifulLoading() {
+  return (
+    <div className="msg-wrap assistant">
+      <div className="msg-bubble msg-ai loading-state-new">
+        <div className="ai-pulse">
+          <div className="pulse-ring"></div>
+          <Bot size={20} className="pulse-bot" />
+        </div>
+        <div className="loading-content">
+          <div className="loading-title">Analyzing request...</div>
+          <div className="loading-bar"><div className="loading-progress"></div></div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ResponseTimer() {
+  const { aiLoading, aiResponseStartTime, aiLastResponseTime } = useStore()
+  const [elapsed, setElapsed] = useState(0)
+
+  useEffect(() => {
+    let interval: any
+    if (aiLoading && aiResponseStartTime) {
+      interval = setInterval(() => {
+        setElapsed(Math.floor((Date.now() - aiResponseStartTime) / 100) / 10)
+      }, 100)
+    } else {
+      setElapsed(0)
+    }
+    return () => clearInterval(interval)
+  }, [aiLoading, aiResponseStartTime])
+
+  if (aiLoading) {
+    return (
+      <div className="response-timer loading">
+        <Loader2 size={10} className="spin" />
+        <span>{elapsed.toFixed(1)}s</span>
+      </div>
+    )
+  }
+
+  if (aiLastResponseTime) {
+    return (
+      <div className="response-timer">
+        <Zap size={10} />
+        <span>{(aiLastResponseTime / 1000).toFixed(1)}s</span>
+      </div>
+    )
+  }
+
+  return null
+}
+
 // ── Model Picker (Copilot-style bottom bar) ─────────────────────────────────
 function ModelPicker() {
-  const { settings, updateSettings } = useStore()
+  const { settings, updateSettings, availableModels, fetchModels } = useStore()
   const [open, setOpen] = useState(false)
-  const [models, setModels] = useState<Record<AiProvider, string[]>>(STATIC_MODELS)
   const [loading, setLoading] = useState<AiProvider | null>(null)
-  const [fetched, setFetched] = useState<Record<string, boolean>>({})
-  const [errors, setErrors] = useState<Record<string, string>>({})
   const ref = useRef<HTMLDivElement>(null)
 
   const provider = settings.activeProvider
@@ -135,23 +260,17 @@ function ModelPicker() {
     return () => document.removeEventListener("mousedown", handler)
   }, [])
 
-  const loadModels = async (p: AiProvider, force = false) => {
-    if (fetched[p] && !force) return
+  const loadModels = async (p: AiProvider) => {
     setLoading(p)
-    setErrors(prev => ({ ...prev, [p]: "" }))
-    const keyMap: Record<AiProvider, keyof typeof settings> = { groq:"groqKey", gemini:"geminiKey", claude:"claudeKey", ollama:"ollamaHost" }
-    const apiKey = settings[keyMap[p]] as string
-    const fetched2 = await fetchModels(p, apiKey, settings.ollamaHost, (err) => {
-      setErrors(prev => ({ ...prev, [p]: err }))
-    })
-    setModels(prev => ({ ...prev, [p]: fetched2.length ? fetched2 : STATIC_MODELS[p] }))
-    setFetched(prev => ({ ...prev, [p]: true }))
+    await fetchModels(p)
     setLoading(null)
   }
 
   const switchProvider = async (p: AiProvider) => {
     updateSettings({ activeProvider: p })
-    await loadModels(p)
+    if (!availableModels[p] || availableModels[p].length === 0) {
+      await loadModels(p)
+    }
   }
 
   const selectModel = (model: string) => {
@@ -161,13 +280,13 @@ function ModelPicker() {
   }
 
   const shortModel = currentModel.split("/").pop()?.split(":")[0] || currentModel
-  const providerModels = models[provider] || STATIC_MODELS[provider] || []
+  const providerModels = availableModels[provider] || []
 
   return (
     <div ref={ref} style={{ position: "relative" }}>
       {/* Trigger button — Copilot style */}
-      <button onClick={() => { setOpen(!open); loadModels(provider) }}
-        title={errors[provider] || `${PROVIDER_LABELS[provider]} — click to change model`}
+      <button onClick={() => { setOpen(!open); if(!providerModels.length) loadModels(provider) }}
+        title={`${PROVIDER_LABELS[provider]} — click to change model`}
         style={{
           display: "flex", alignItems: "center", gap: 5,
           background: open ? "var(--bg-hover)" : "transparent",
@@ -220,7 +339,7 @@ function ModelPicker() {
                 ) : (
                   <>No models found<br/>
                   <button className="btn btn-ghost" style={{ marginTop: 8, fontSize: 11 }}
-                    onClick={() => { loadModels(provider, true) }}>
+                    onClick={() => { loadModels(provider) }}>
                     <RefreshCw size={11} /> Retry
                   </button></>
                 )}
@@ -256,7 +375,7 @@ function ModelPicker() {
           <div style={{ padding: "6px 10px 8px", borderTop: "1px solid var(--border-light)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{providerModels.length} models</span>
             <button style={{ fontSize: 10, color: "var(--accent)", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontFamily: "inherit" }}
-              onClick={() => { loadModels(provider, true) }}>
+              onClick={() => { loadModels(provider) }}>
               <RefreshCw size={10} /> Refresh
             </button>
           </div>
@@ -268,24 +387,396 @@ function ModelPicker() {
 
 // ── Main AI Panel ────────────────────────────────────────────────────────────
 export default function AiPanel() {
-  const { aiMessages, aiLoading, sendAiMessage, clearAiMessages } = useStore()
+  const {
+    aiMessages, aiLoading, sendAiMessage, clearAiMessages,
+    settings, updateSettings, addAiMessage, updateAiMessage, setAiLoading,
+    enhancerLoading
+  } = useStore()
+  const { addCheckpoint } = useHistoryStore()
+
   const [input, setInput] = useState("")
   const [showCommands, setShowCommands] = useState(false)
+  const [detectedSkills, setDetectedSkills] = useState<Skill[]>([])
+  const [showHistory, setShowHistory] = useState(false)
+
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [aiMessages, aiLoading])
 
+  // Skill detection on input change
+  useEffect(() => {
+    setDetectedSkills(detectSkills(input))
+  }, [input])
+
   const send = async () => {
     const text = input.trim()
     if (!text || aiLoading) return
+
+    const mode = settings.activeMode || 'ask'
+    const skills = detectSkills(text)
+
     setInput(""); setShowCommands(false)
-    await sendAiMessage(text)
+
+    // Skill Injection logic
+    const baseSystemPrompt = `You are CodeDroid AI Copilot, an expert coding assistant embedded in an IDE.
+Be concise, technical, and precise. Format code with proper markdown code blocks.`
+
+    let systemInjected = buildSystemPrompt(skills, baseSystemPrompt)
+
+    if (mode === 'plan') {
+      systemInjected += "\n\nDo not execute. Return only a numbered step-by-step plan in JSON format: {steps: [{id, title, description, estimatedComplexity}]}"
+    } else if (mode === 'agent') {
+      systemInjected += `\n\nYou are operating in AGENT mode. Act as an autonomous coding agent.
+Your workflow:
+1. **Analyze** the user's request thoroughly — understand the goal, constraints, and context.
+2. **Reason** step-by-step about the best approach, considering best practices and potential issues.
+3. **Generate** a complete, production-ready implementation with full code, clear explanations, and any necessary instructions.
+4. **Explain** what you built, why you made specific design decisions, and how to use it.
+
+Important rules for Agent mode:
+- Always provide COMPLETE, working code — never partial snippets or placeholders.
+- If the user mentions skills or frameworks (e.g., Tailwind, shadcn/ui), use them fully in your implementation.
+- Structure your response clearly with sections: Analysis, Implementation, and Usage.
+- Be proactive: anticipate follow-up needs and address them.
+- If the task involves multiple files, provide all of them clearly labeled.`
+    }
+
+    const provider = settings.activeProvider
+    addAiMessage({ role: 'user', content: text, provider, mode, appliedSkills: skills.map(s => s.name) })
+    setAiLoading(true)
+    useStore.setState({ aiResponseStartTime: Date.now(), aiLastResponseTime: null })
+
+    const assistantId = addAiMessage({
+      role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: skills.map(s => s.name)
+    })
+
+    const trySidecar = (): Promise<boolean> => {
+      return new Promise((resolve) => {
+        let hasReceivedData = false
+        let resolved = false
+
+        const cleanupAndResolve = (success: boolean) => {
+          if (resolved) return
+          resolved = true
+          resolve(success)
+        }
+
+        try {
+          const ws = new WebSocket('ws://127.0.0.1:8765/ws/chat')
+          let fullText = ''
+          let agentSteps: AgentStep[] = []
+
+          // Timeout if sidecar doesn't respond or connect within 1500ms
+          const timeout = setTimeout(() => {
+            if (!hasReceivedData) {
+              ws.close()
+              cleanupAndResolve(false)
+            }
+          }, 1500)
+
+          ws.onopen = () => {
+            const key = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
+            const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
+
+            ws.send(JSON.stringify({
+              messages: aiMessages.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })).concat([{ role: 'user', content: text }]),
+              provider, api_key: key, model, host: settings.ollamaHost,
+              system: systemInjected,
+              mode,
+              skills: skills.map(s => s.id)
+            }))
+          }
+
+          ws.onmessage = (event) => {
+            hasReceivedData = true
+            clearTimeout(timeout)
+            cleanupAndResolve(true)
+
+            const data = JSON.parse(event.data)
+            if (data.type === 'token') {
+              fullText += data.text
+              updateAiMessage(assistantId, fullText, true)
+            } else if (data.type === 'tool_start') {
+              agentSteps.push({ id: Math.random().toString(), tool: data.tool, input: JSON.stringify(data.args), status: 'running' })
+              useStore.setState((s) => ({
+                aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, agentSteps: [...agentSteps] } : m)
+              }))
+            } else if (data.type === 'tool_end') {
+              const step = agentSteps.find(s => s.tool === data.tool && s.status === 'running')
+              if (step) {
+                step.status = 'success'
+                step.output = data.output
+              }
+              useStore.setState((s) => ({
+                aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, agentSteps: [...agentSteps] } : m)
+              }))
+            } else if (data.type === 'done') {
+              // Parse steps if plan mode
+              let planSteps: PlanStep[] = []
+              if (mode === 'plan') {
+                try {
+                  const match = fullText.match(/\{[\s\S]*\}/)
+                  if (match) {
+                    const parsed = JSON.parse(match[0])
+                    planSteps = parsed.steps || []
+                  }
+                } catch {}
+              }
+
+              updateAiMessage(assistantId, fullText, false)
+              if (planSteps.length > 0) {
+                useStore.setState((s) => ({
+                  aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, planSteps } : m)
+                }))
+              }
+
+              setAiLoading(false)
+              const duration = Date.now() - (useStore.getState().aiResponseStartTime || Date.now())
+              useStore.setState({ aiLastResponseTime: duration, aiResponseStartTime: null })
+
+              // History Checkpoint
+              addCheckpoint({
+                id: Math.random().toString(),
+                timestamp: Date.now(),
+                mode, userMessage: text, aiResponse: fullText,
+                skillsApplied: skills.map(s => s.name),
+                agentSteps: [...agentSteps],
+                planSteps,
+                provider,
+                model: settings[`${provider}Model` as keyof typeof settings] as string
+              })
+
+              ws.close()
+            }
+          }
+
+          ws.onerror = () => {
+            clearTimeout(timeout)
+            ws.close()
+            cleanupAndResolve(false)
+          }
+
+          ws.onclose = () => {
+            clearTimeout(timeout)
+            cleanupAndResolve(false)
+          }
+
+        } catch (e) {
+          cleanupAndResolve(false)
+        }
+      })
+    }
+
+    const runDirect = async () => {
+      try {
+        let fullText = ''
+        const key = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
+        const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
+
+        const history = aiMessages.map(m => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: m.content
+        }))
+
+        if (!key && provider !== 'ollama') {
+          throw new Error(`API key for ${provider.toUpperCase()} is missing. Please set it in Settings.`)
+        }
+
+        if (provider === 'groq') {
+          const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: model, stream: true,
+              messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+            })
+          })
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}))
+            throw new Error(errData.error?.message || `HTTP ${res.status}`)
+          }
+
+          const reader = res.body!.getReader()
+          const dec = new TextDecoder()
+          while (true) {
+            const { done, value } = await reader.read(); if (done) break
+            const chunk = dec.decode(value)
+            for (const line of chunk.split('\n')) {
+              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                try {
+                  const d = JSON.parse(line.slice(6))
+                  fullText += d.choices?.[0]?.delta?.content || ''
+                  updateAiMessage(assistantId, fullText, true)
+                } catch {}
+              }
+            }
+          }
+        } else if (provider === 'gemini') {
+          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system_instruction: { parts: [{ text: systemInjected }] },
+              contents: [...history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })), { role: 'user', parts: [{ text: text }] }]
+            })
+          })
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}))
+            throw new Error(errData.error?.message || `HTTP ${res.status}`)
+          }
+
+          const data = await res.json()
+          fullText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response'
+          updateAiMessage(assistantId, fullText, true)
+        } else if (provider === 'claude') {
+          const res = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'x-api-key': key,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: model,
+              max_tokens: 4096,
+              system: systemInjected,
+              messages: history.concat([{ role: 'user', content: text }])
+            })
+          })
+
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}))
+            throw new Error(errData.error?.message || `HTTP ${res.status}`)
+          }
+
+          const data = await res.json()
+          fullText = data.content?.[0]?.text || ''
+          updateAiMessage(assistantId, fullText, true)
+        } else if (provider === 'ollama') {
+          if (window.api && window.api.ollamaChat) {
+            window.api.removeOllamaListeners()
+
+            await new Promise<void>((resolve, reject) => {
+              window.api.onOllamaChunk((chunk: any) => {
+                fullText += chunk.message?.content || ''
+                updateAiMessage(assistantId, fullText, true)
+              })
+
+              window.api.onOllamaDone(() => {
+                resolve()
+              })
+
+              window.api.ollamaChat(settings.ollamaHost, {
+                model: model,
+                stream: true,
+                messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+              }).then(res => {
+                if (!res.ok) reject(new Error(res.error))
+              })
+            })
+          } else {
+            const res = await fetch(`${settings.ollamaHost}/api/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: model, stream: true,
+                messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+              })
+            })
+
+            if (!res.ok) throw new Error(`Ollama returned status ${res.status}`)
+
+            const reader = res.body!.getReader()
+            const dec = new TextDecoder()
+            while (true) {
+              const { done, value } = await reader.read(); if (done) break
+              const chunk = dec.decode(value)
+              for (const line of chunk.split('\n')) {
+                if (line.trim()) {
+                  try {
+                    const d = JSON.parse(line)
+                    fullText += d.message?.content || ''
+                    updateAiMessage(assistantId, fullText, true)
+                  } catch {}
+                }
+              }
+            }
+          }
+        }
+
+        let planSteps: PlanStep[] = []
+        if (mode === 'plan') {
+          try {
+            const match = fullText.match(/\{[\s\S]*\}/)
+            if (match) {
+              const parsed = JSON.parse(match[0])
+              planSteps = parsed.steps || []
+            }
+          } catch {}
+        }
+
+        updateAiMessage(assistantId, fullText, false)
+        if (planSteps.length > 0) {
+          useStore.setState((s) => ({
+            aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, planSteps } : m)
+          }))
+        }
+
+        setAiLoading(false)
+        const duration = Date.now() - (useStore.getState().aiResponseStartTime || Date.now())
+        useStore.setState({ aiLastResponseTime: duration, aiResponseStartTime: null })
+
+        addCheckpoint({
+          id: Math.random().toString(),
+          timestamp: Date.now(),
+          mode, userMessage: text, aiResponse: fullText,
+          skillsApplied: skills.map(s => s.name),
+          agentSteps: [],
+          planSteps,
+          provider,
+          model: settings[`${provider}Model` as keyof typeof settings] as string
+        })
+
+      } catch (e: any) {
+        console.error("Direct API failed:", e)
+        updateAiMessage(assistantId, `Error: ${e.message || e}. Please make sure your API keys are correct and you are connected to the network.`, false)
+        setAiLoading(false)
+        useStore.setState({ aiResponseStartTime: null })
+      }
+    }
+
+    const success = await trySidecar()
+    if (!success) {
+      console.warn("[AiPanel] Sidecar WebSocket failed/unreachable. Falling back to direct API...")
+      await runDirect()
+    }
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send() }
-    if (e.key === "Escape") setShowCommands(false)
+    if (e.ctrlKey && e.key === '1') { e.preventDefault(); updateSettings({ activeMode: 'plan' }) }
+    if (e.ctrlKey && e.key === '2') { e.preventDefault(); updateSettings({ activeMode: 'agent' }) }
+    if (e.ctrlKey && e.key === '3') { e.preventDefault(); updateSettings({ activeMode: 'ask' }) }
+  }
+
+  const handleExecuteStep = async (messageId: string, stepId: string) => {
+    // Implement step execution logic
+    // 1. Update step status to 'running'
+    // 2. Send request to sidecar
+    // 3. Update result and status to 'completed'
+  }
+
+  const handleExecutePlan = async (messageId: string) => {
+    const msg = aiMessages.find(m => m.id === messageId)
+    if (!msg || !msg.planSteps) return
+
+    // Sequential execution
+    for (const step of msg.planSteps) {
+      // Logic to execute each step
+    }
   }
 
   const filteredCmds = SLASH_COMMANDS.filter(c => input === "/" || c.cmd.startsWith(input.split(" ")[0]))
@@ -297,27 +788,34 @@ export default function AiPanel() {
           <Sparkles size={14} style={{ color: "var(--accent)" }} />
           <span>AI Copilot</span>
         </div>
-        <button className="icon-btn" onClick={clearAiMessages} title="Clear"><Trash2 size={13} /></button>
+        <div style={{ display: 'flex', gap: 4 }}>
+          <button className="icon-btn" onClick={() => setShowHistory(true)} title="History"><History size={13} /></button>
+          <button className="icon-btn" onClick={clearAiMessages} title="Clear"><Trash2 size={13} /></button>
+        </div>
       </div>
+
+      {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
+
+      <ChatModeSelector />
 
       <div className="ai-messages">
         {aiMessages.length === 0 && (
           <div className="ai-welcome">
             <Bot size={28} style={{ color: "var(--accent)", marginBottom: 8 }} />
             <div className="ai-welcome-title">CodeDroid AI</div>
-            <div className="ai-welcome-sub">Ask anything about your code</div>
-            <div className="ai-suggestions">
-              {["/fix bugs in selected code","/explain this function","/write unit tests","/refactor for performance"].map(s => (
-                <button key={s} className="ai-suggestion" onClick={() => { setInput(s); inputRef.current?.focus() }}>{s}</button>
-              ))}
-            </div>
+            <div className="ai-welcome-sub">How can I help you today?</div>
           </div>
         )}
-        {aiMessages.map(msg => <MessageBubble key={msg.id} msg={msg} />)}
-        {aiLoading && aiMessages[aiMessages.length-1]?.role !== "assistant" && (
-          <div className="msg-wrap assistant">
-            <div className="msg-bubble msg-ai"><Loader2 size={14} className="spin" style={{color:"var(--accent)"}} /></div>
-          </div>
+        {aiMessages.map((msg, idx) => {
+          // If this is an empty assistant message and we are loading,
+          // don't show the bubble yet (BeautifulLoading will show instead)
+          if (msg.role === 'assistant' && !msg.content && aiLoading && idx === aiMessages.length - 1) {
+            return null
+          }
+          return <MessageBubble key={msg.id} msg={msg} onExecutePlan={handleExecutePlan} />
+        })}
+        {aiLoading && (!aiMessages.length || aiMessages[aiMessages.length-1].role !== 'assistant' || !aiMessages[aiMessages.length-1].content) && (
+          <BeautifulLoading />
         )}
         <div ref={bottomRef} />
       </div>
@@ -334,26 +832,47 @@ export default function AiPanel() {
         </div>
       )}
 
+      {/* Skills detection pill */}
+      {detectedSkills.length > 0 && (
+        <div className="detected-skills-bar">
+          <span className="pill">
+            🔧 Skills: {detectedSkills.map(s => s.name).join(' · ')}
+            <span className="info-icon" title={detectedSkills.map(s => `${s.name}: ${s.description}`).join('\n')}>ℹ️</span>
+          </span>
+        </div>
+      )}
+
       {/* Input area */}
       <div className="ai-input-area">
-        <div className="ai-input-wrap">
+        <div className={`ai-input-wrap ${enhancerLoading ? 'enhancing' : ''}`}>
           <textarea ref={inputRef} className="ai-input"
-            placeholder="Ask AI... (/ for commands)"
+            placeholder={`Ask AI in ${settings.activeMode || 'ask'} mode...`}
             value={input}
             onChange={e => { setInput(e.target.value); setShowCommands(e.target.value.startsWith("/") && e.target.value.length > 0) }}
-            onKeyDown={handleKeyDown} rows={1} style={{ resize: "none" }} />
-          <button className="ai-send-btn" onClick={send} disabled={!input.trim() || aiLoading}>
-            {aiLoading ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
-          </button>
+            onKeyDown={handleKeyDown} rows={4} />
+
+          {enhancerLoading && (
+            <div className="enhancer-status-inline">
+              <Sparkles size={12} className="pulse" />
+              <span>AI is polishing your prompt...</span>
+            </div>
+          )}
+
+          <div className="input-actions">
+            <PromptEnhancer input={input} setInput={setInput} />
+            <button className="ai-send-btn" onClick={send} disabled={!input.trim() || aiLoading}>
+              {aiLoading ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
+            </button>
+          </div>
         </div>
 
-        {/* ── Copilot-style model picker bar ── */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "5px 2px 2px" }}>
-          <ModelPicker />
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <ModelPicker />
+            <ResponseTimer />
+          </div>
           <span style={{ fontSize: 10, color: "var(--text-dim)" }}>
-            <kbd style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 2, padding: "0 3px", fontSize: 9, fontFamily: "monospace" }}>Enter</kbd> send
-            {" · "}
-            <kbd style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 2, padding: "0 3px", fontSize: 9, fontFamily: "monospace" }}>/</kbd> cmds
+            Ctrl+1/2/3 modes
           </span>
         </div>
       </div>
