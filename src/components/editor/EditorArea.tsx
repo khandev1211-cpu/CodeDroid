@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import Editor, { OnMount } from '@monaco-editor/react'
 import { X, Circle, ChevronRight, SplitSquareHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
@@ -14,7 +14,6 @@ const LANG_ICON_COLOR: Record<string, string> = {
 
 function TabBar() {
   const { openFiles, activeFileIndex, closeFile, setActiveFile, saveFile } = useStore()
-
   return (
     <div className="tab-bar">
       {openFiles.map((file, i) => (
@@ -45,7 +44,6 @@ function Breadcrumbs() {
   if (!settings.showBreadcrumbs) return null
   const file = openFiles[activeFileIndex]
   if (!file) return null
-
   const parts = file.path.replace(/\\/g, '/').split('/')
   return (
     <div className="breadcrumbs">
@@ -65,91 +63,108 @@ export default function EditorArea() {
     settings, theme, setInlineAi, openNewFolder,
     inlineErrors, clearInlineErrors,
   } = useStore()
-  const editorRef = useRef<any>(null)
+
+  const editorRef      = useRef<any>(null)
+  const monacoRef      = useRef<any>(null)
   const [editorReady, setEditorReady] = useState(false)
 
   const file = openFiles[activeFileIndex]
 
-  const getMonacoTheme = () => {
-    const isDark = theme.category !== 'light'
-    return isDark ? 'codedroid-dark' : 'codedroid-light'
-  }
+  // ── All hooks BEFORE any conditional return ──────────────────────────────
 
-  const defineTheme = (monaco: any) => {
+  // Re-apply Monaco theme on theme change
+  useEffect(() => {
+    if (!editorRef.current || !monacoRef.current) return
+    const monaco = monacoRef.current
     const c = theme.colors
-    monaco.editor.defineTheme('codedroid-dark', {
-      base: 'vs-dark',
+    const isDark = theme.category !== 'light'
+    const themeId = isDark ? 'codedroid-dark' : 'codedroid-light'
+    monaco.editor.defineTheme(themeId, {
+      base: isDark ? 'vs-dark' : 'vs',
       inherit: true,
       rules: [
-        { token: 'keyword', foreground: c.keyword.slice(1) },
-        { token: 'string', foreground: c.string.slice(1) },
-        { token: 'comment', foreground: c.comment.slice(1), fontStyle: 'italic' },
-        { token: 'number', foreground: c.number.slice(1) },
+        { token: 'keyword',    foreground: c.keyword.slice(1) },
+        { token: 'string',     foreground: c.string.slice(1) },
+        { token: 'comment',    foreground: c.comment.slice(1), fontStyle: 'italic' },
+        { token: 'number',     foreground: c.number.slice(1) },
         { token: 'identifier', foreground: c.variable.slice(1) },
-        { token: 'type', foreground: c.type.slice(1) },
-        { token: 'function', foreground: c.func.slice(1) },
-        { token: 'operator', foreground: c.operator.slice(1) },
+        { token: 'type',       foreground: c.type.slice(1) },
+        { token: 'function',   foreground: c.func.slice(1) },
+        { token: 'operator',   foreground: c.operator.slice(1) },
       ],
       colors: {
-        'editor.background': c.bgEditor,
-        'editor.foreground': c.text,
-        'editor.lineHighlightBackground': c.lineHighlight,
-        'editor.selectionBackground': c.selection,
-        'editorLineNumber.foreground': c.textDim,
+        'editor.background':               c.bgEditor,
+        'editor.foreground':               c.text,
+        'editor.lineHighlightBackground':  c.lineHighlight,
+        'editor.selectionBackground':      c.selection,
+        'editorLineNumber.foreground':     c.textDim,
         'editorLineNumber.activeForeground': c.textMuted,
-        'editor.findMatchBackground': c.accentSoft,
-        'editorCursor.foreground': c.accent,
-        'editorWhitespace.foreground': c.border,
-        'editorIndentGuide.background': c.borderLight,
-        'editorIndentGuide.activeBackground': c.border,
-        'scrollbarSlider.background': c.scrollbar + '88',
+        'editor.findMatchBackground':      c.accentSoft,
+        'editorCursor.foreground':         c.accent,
+        'editorWhitespace.foreground':     c.border,
+        'scrollbarSlider.background':      c.scrollbar + '88',
         'scrollbarSlider.hoverBackground': c.scrollbar,
-        'editorWidget.background': c.bgPanel,
-        'editorWidget.border': c.border,
-        'input.background': c.bgInput,
-        'input.foreground': c.text,
-        'input.border': c.border,
-        'focusBorder': c.accent,
-        'dropdown.background': c.bgPanel,
-        'list.hoverBackground': c.bgHover,
-        'list.activeSelectionBackground': c.bgActive,
-        'list.focusBackground': c.bgActive,
+        'editorWidget.background':         c.bgPanel,
+        'editorWidget.border':             c.border,
+        'input.background':                c.bgInput,
+        'input.foreground':                c.text,
+        'focusBorder':                     c.accent,
+        'dropdown.background':             c.bgPanel,
+        'list.hoverBackground':            c.bgHover,
+        'list.activeSelectionBackground':  c.bgActive,
       }
     })
-    monaco.editor.defineTheme('codedroid-light', {
-      base: 'vs',
-      inherit: true,
-      rules: [
-        { token: 'keyword', foreground: c.keyword.slice(1) },
-        { token: 'string', foreground: c.string.slice(1) },
-        { token: 'comment', foreground: c.comment.slice(1), fontStyle: 'italic' },
-      ],
-      colors: {
-        'editor.background': c.bgEditor,
-        'editor.foreground': c.text,
-        'editor.lineHighlightBackground': c.lineHighlight,
-        'editor.selectionBackground': c.selection,
-        'editorLineNumber.foreground': c.textDim,
-        'editorCursor.foreground': c.accent,
+    monaco.editor.setTheme(themeId)
+  }, [theme])
+
+  // Update Monaco model language when file is renamed (extension changes)
+  useEffect(() => {
+    if (!editorRef.current || !monacoRef.current || !file) return
+    const model = editorRef.current.getModel()
+    if (!model) return
+    if (model.getLanguageId() !== file.language) {
+      monacoRef.current.editor.setModelLanguage(model, file.language)
+    }
+  }, [file?.language, file?.path])
+
+  // Apply inline error decorations from agent auto-fix
+  useEffect(() => {
+    if (!editorRef.current || !monacoRef.current) return
+    if (!file) { clearErrorDecorations(editorRef.current); return }
+    const fileErrors = inlineErrors.filter(e =>
+      e.file === file.path || file.path.endsWith(e.file)
+    )
+    if (fileErrors.length === 0) {
+      clearErrorDecorations(editorRef.current)
+    } else {
+      applyErrorDecorations(editorRef.current, monacoRef.current, fileErrors)
+    }
+  }, [inlineErrors, activeFileIndex, openFiles])
+
+  // goto-line event from ProblemsPanel click
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { line, column } = (e as CustomEvent).detail
+      if (editorRef.current) {
+        editorRef.current.revealLineInCenter(line)
+        editorRef.current.setPosition({ lineNumber: line, column: column ?? 1 })
+        editorRef.current.focus()
       }
-    })
-  }
+    }
+    window.addEventListener('codedroid-goto-line', handler)
+    return () => window.removeEventListener('codedroid-goto-line', handler)
+  }, [])
 
-  const handleEditorMount: OnMount = (editor, monaco) => {
-    editorRef.current = editor
-    defineTheme(monaco)
-    monaco.editor.setTheme(getMonacoTheme())
-    setEditorReady(true)
-
-    // Re-apply theme whenever applyTheme() fires the custom event
+  // Cleanup Monaco theme listener on unmount
+  useEffect(() => {
     const onThemeChange = (e: Event) => {
       const newTheme = (e as CustomEvent).detail
+      if (!editorRef.current || !monacoRef.current) return
       const c = newTheme.colors
       const isDark = newTheme.category !== 'light'
       const themeId = isDark ? 'codedroid-dark' : 'codedroid-light'
-      monaco.editor.defineTheme(themeId, {
-        base: isDark ? 'vs-dark' : 'vs',
-        inherit: true,
+      monacoRef.current.editor.defineTheme(themeId, {
+        base: isDark ? 'vs-dark' : 'vs', inherit: true,
         rules: [
           { token: 'keyword',    foreground: c.keyword.slice(1) },
           { token: 'string',     foreground: c.string.slice(1) },
@@ -161,88 +176,26 @@ export default function EditorArea() {
           { token: 'operator',   foreground: c.operator.slice(1) },
         ],
         colors: {
-          'editor.background':               c.bgEditor,
-          'editor.foreground':               c.text,
-          'editor.lineHighlightBackground':  c.lineHighlight,
-          'editor.selectionBackground':      c.selection,
-          'editorLineNumber.foreground':     c.textDim,
-          'editorLineNumber.activeForeground': c.textMuted,
-          'editor.findMatchBackground':      c.accentSoft,
-          'editorCursor.foreground':         c.accent,
-          'editorWhitespace.foreground':     c.border,
-          'editorIndentGuide.background':    c.borderLight,
-          'editorIndentGuide.activeBackground': c.border,
-          'scrollbarSlider.background':      c.scrollbar + '88',
-          'scrollbarSlider.hoverBackground': c.scrollbar,
-          'editorWidget.background':         c.bgPanel,
-          'editorWidget.border':             c.border,
-          'input.background':                c.bgInput,
-          'input.foreground':                c.text,
-          'input.border':                    c.border,
-          'focusBorder':                     c.accent,
-          'dropdown.background':             c.bgPanel,
-          'list.hoverBackground':            c.bgHover,
-          'list.activeSelectionBackground':  c.bgActive,
-          'list.focusBackground':            c.bgActive,
+          'editor.background':              c.bgEditor,
+          'editor.foreground':              c.text,
+          'editor.lineHighlightBackground': c.lineHighlight,
+          'editor.selectionBackground':     c.selection,
+          'editorLineNumber.foreground':    c.textDim,
+          'editorCursor.foreground':        c.accent,
+          'scrollbarSlider.background':     c.scrollbar + '88',
+          'editorWidget.background':        c.bgPanel,
+          'focusBorder':                    c.accent,
         }
       })
-      monaco.editor.setTheme(themeId)
+      monacoRef.current.editor.setTheme(themeId)
     }
     window.addEventListener('codedroid-theme-change', onThemeChange)
-    // Store cleanup fn on the editor instance so the effect cleanup can reach it
-    ;(editor as any)._themeCleanup = () => window.removeEventListener('codedroid-theme-change', onThemeChange)
-
-    // Ctrl+S = save
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-      saveFile(activeFileIndex)
-    })
-
-    // Ctrl+I = inline AI
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI, () => {
-      const selection = editor.getSelection()
-      const selectedText = editor.getModel()?.getValueInRange(selection!) || ''
-      const line = selection?.startLineNumber || 1
-      setInlineAi(true, { line, selection: selectedText })
-    })
-  }
-
-  // Cleanup Monaco theme listener on unmount
-  useEffect(() => {
-    return () => {
-      ;(editorRef.current as any)?._themeCleanup?.()
-    }
+    return () => window.removeEventListener('codedroid-theme-change', onThemeChange)
   }, [])
 
-  // Apply inline error decorations from agent auto-fix
-  useEffect(() => {
-    if (!editorRef.current) return
-    const monacoNs = (window as any).monaco
-    if (!monacoNs) return
-    const activeFile = openFiles[activeFileIndex]
-    if (!activeFile) { clearErrorDecorations(editorRef.current); return }
-    // Only show errors relevant to the current file
-    const fileErrors = inlineErrors.filter(e =>
-      e.file === activeFile.path || activeFile.path.endsWith(e.file)
-    )
-    if (fileErrors.length === 0) {
-      clearErrorDecorations(editorRef.current)
-    } else {
-      applyErrorDecorations(editorRef.current, monacoNs, fileErrors)
-    }
-  }, [inlineErrors, activeFileIndex, openFiles])
+  // ── Handlers ─────────────────────────────────────────────────────────────
 
-  // Update Monaco model language when file is renamed (extension changes)
-  useEffect(() => {
-    if (!editorRef.current || !file) return
-    const model = editorRef.current.getModel()
-    if (!model) return
-    const monaco = (window as any).monaco
-    if (!monaco) return
-    const currentLang = model.getLanguageId()
-    if (currentLang !== file.language) {
-      monaco.editor.setModelLanguage(model, file.language)
-    }
-  }, [file?.language, file?.path])
+  const getMonacoTheme = () => theme.category !== 'light' ? 'codedroid-dark' : 'codedroid-light'
 
   const handleChange = (value: string | undefined) => {
     if (value !== undefined && file) {
@@ -251,6 +204,66 @@ export default function EditorArea() {
     }
   }
 
+  const handleEditorMount: OnMount = (editor, monaco) => {
+    editorRef.current  = editor
+    monacoRef.current  = monaco
+    setEditorReady(true)
+
+    // Define initial theme
+    const c = theme.colors
+    const isDark = theme.category !== 'light'
+    const themeId = isDark ? 'codedroid-dark' : 'codedroid-light'
+    monaco.editor.defineTheme(themeId, {
+      base: isDark ? 'vs-dark' : 'vs', inherit: true,
+      rules: [
+        { token: 'keyword',    foreground: c.keyword.slice(1) },
+        { token: 'string',     foreground: c.string.slice(1) },
+        { token: 'comment',    foreground: c.comment.slice(1), fontStyle: 'italic' },
+        { token: 'number',     foreground: c.number.slice(1) },
+        { token: 'identifier', foreground: c.variable.slice(1) },
+        { token: 'type',       foreground: c.type.slice(1) },
+        { token: 'function',   foreground: c.func.slice(1) },
+        { token: 'operator',   foreground: c.operator.slice(1) },
+      ],
+      colors: {
+        'editor.background':               c.bgEditor,
+        'editor.foreground':               c.text,
+        'editor.lineHighlightBackground':  c.lineHighlight,
+        'editor.selectionBackground':      c.selection,
+        'editorLineNumber.foreground':     c.textDim,
+        'editorLineNumber.activeForeground': c.textMuted,
+        'editor.findMatchBackground':      c.accentSoft,
+        'editorCursor.foreground':         c.accent,
+        'editorWhitespace.foreground':     c.border,
+        'scrollbarSlider.background':      c.scrollbar + '88',
+        'scrollbarSlider.hoverBackground': c.scrollbar,
+        'editorWidget.background':         c.bgPanel,
+        'editorWidget.border':             c.border,
+        'input.background':                c.bgInput,
+        'input.foreground':                c.text,
+        'focusBorder':                     c.accent,
+        'dropdown.background':             c.bgPanel,
+        'list.hoverBackground':            c.bgHover,
+        'list.activeSelectionBackground':  c.bgActive,
+      }
+    })
+    monaco.editor.setTheme(themeId)
+
+    // Ctrl+S — save
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      saveFile(activeFileIndex)
+    })
+
+    // Ctrl+I — inline AI
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyI, () => {
+      const selection = editor.getSelection()
+      const selectedText = editor.getModel()?.getValueInRange(selection!) || ''
+      const line = selection?.startLineNumber || 1
+      setInlineAi(true, { line, selection: selectedText })
+    })
+  }
+
+  // ── Welcome screen (no file open) — after all hooks ──────────────────────
   if (!file) {
     return (
       <div className="editor-area">
@@ -271,9 +284,9 @@ export default function EditorArea() {
           <div className="welcome-shortcuts">
             {[
               ['Ctrl+Shift+P', 'Command Palette'],
-              ['Ctrl+B', 'Toggle Sidebar'],
-              ['Ctrl+J', 'Toggle Terminal'],
-              ['Ctrl+I', 'Inline AI Edit'],
+              ['Ctrl+B',       'Toggle Sidebar'],
+              ['Ctrl+J',       'Toggle Terminal'],
+              ['Ctrl+I',       'Inline AI Edit'],
             ].map(([key, desc]) => (
               <div key={key} className="welcome-shortcut">
                 <kbd>{key}</kbd>
@@ -286,55 +299,43 @@ export default function EditorArea() {
     )
   }
 
-  // goto-line event from ProblemsPanel click
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { line, column } = (e as CustomEvent).detail
-      if (editorRef.current) {
-        editorRef.current.revealLineInCenter(line)
-        editorRef.current.setPosition({ lineNumber: line, column: column ?? 1 })
-        editorRef.current.focus()
-      }
-    }
-    window.addEventListener('codedroid-goto-line', handler)
-    return () => window.removeEventListener('codedroid-goto-line', handler)
-  }, [])
-
+  // ── Editor with open file ─────────────────────────────────────────────────
   return (
     <div className="editor-area">
       <TabBar />
       <Breadcrumbs />
       <div className="editor-container">
         <Editor
+          key={file.path}
           language={file.language}
           value={file.content}
           theme={getMonacoTheme()}
           onChange={handleChange}
           onMount={handleEditorMount}
           options={{
-            fontSize: settings.fontSize,
-            fontFamily: settings.fontFamily,
-            wordWrap: settings.wordWrap ? 'on' : 'off',
-            minimap: { enabled: settings.minimap },
-            lineNumbers: settings.lineNumbers ? 'on' : 'off',
-            tabSize: settings.tabSize,
-            insertSpaces: true,
-            scrollBeyondLastLine: false,
-            renderWhitespace: 'selection',
-            smoothScrolling: true,
-            cursorBlinking: 'smooth',
+            fontSize:               settings.fontSize,
+            fontFamily:             settings.fontFamily,
+            wordWrap:               settings.wordWrap ? 'on' : 'off',
+            minimap:                { enabled: settings.minimap },
+            lineNumbers:            settings.lineNumbers ? 'on' : 'off',
+            tabSize:                settings.tabSize,
+            insertSpaces:           true,
+            scrollBeyondLastLine:   false,
+            renderWhitespace:       'selection',
+            smoothScrolling:        true,
+            cursorBlinking:         'smooth',
             cursorSmoothCaretAnimation: 'on',
-            renderLineHighlight: 'line',
+            renderLineHighlight:    'line',
             bracketPairColorization: { enabled: true },
-            guides: { bracketPairs: true, indentation: true },
-            padding: { top: 8, bottom: 8 },
-            suggest: { showKeywords: true, showSnippets: true },
-            quickSuggestions: { other: true, comments: true, strings: true },
-            formatOnPaste: true,
-            autoIndent: 'advanced',
-            overviewRulerLanes: 3,
-            glyphMargin: true,
-            scrollbar: { vertical: 'auto', horizontal: 'auto', verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+            guides:                 { bracketPairs: true, indentation: true },
+            padding:                { top: 8, bottom: 8 },
+            suggest:                { showKeywords: true, showSnippets: true },
+            quickSuggestions:       { other: true, comments: true, strings: true },
+            formatOnPaste:          true,
+            autoIndent:             'advanced',
+            overviewRulerLanes:     3,
+            glyphMargin:            true,
+            scrollbar:              { vertical: 'auto', horizontal: 'auto', verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
           }}
         />
       </div>

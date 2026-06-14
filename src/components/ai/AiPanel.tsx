@@ -385,6 +385,65 @@ function ModelPicker() {
   )
 }
 
+/**
+ * extractFileBlocks — parse AI response for code blocks that represent files.
+ * Looks for:
+ *   ```python filename.py
+ *   <code>
+ *   ```
+ * or lines like "**filename.py**" / "# filename.py" / "File: filename.py" before a code block.
+ * Returns array of { filename, content, language }.
+ */
+function extractFileBlocks(text: string): Array<{ filename: string; content: string; language: string }> {
+  const results: Array<{ filename: string; content: string; language: string }> = []
+  // Match ```lang? filename?\n...``` blocks
+  const fenceRe = /```(\w+)?(?:\s+([^\n]+))?\n([\s\S]*?)```/g
+  let m: RegExpExecArray | null
+  while ((m = fenceRe.exec(text)) !== null) {
+    const lang     = (m[1] || '').trim()
+    const rawLabel = (m[2] || '').trim()
+    const code     = m[3]
+
+    let filename = ''
+
+    // Label on the fence line: ```python scraper.py
+    if (rawLabel && /\.[a-z]{1,5}$/i.test(rawLabel)) {
+      filename = rawLabel.replace(/[`'"*]/g, '').trim()
+    }
+
+    // Look for a filename marker in the 3 lines before this block
+    if (!filename) {
+      const before = text.slice(Math.max(0, m.index - 200), m.index)
+      const linesBefore = before.split('\n').slice(-4)
+      for (const line of linesBefore.reverse()) {
+        const clean = line.replace(/[*#`_]/g, '').trim()
+        // "File: scraper.py" or "**scraper.py**" or "# scraper.py"
+        const nameMatch = clean.match(/(?:file[:\s]+)?([a-zA-Z0-9_\-./]+\.[a-z]{1,5})$/i)
+        if (nameMatch) { filename = nameMatch[1]; break }
+      }
+    }
+
+    // Last resort: derive filename from language
+    if (!filename && lang) {
+      const EXT: Record<string, string> = {
+        python: 'script.py', javascript: 'script.js', typescript: 'script.ts',
+        jsx: 'component.jsx', tsx: 'component.tsx', bash: 'run.sh',
+        shell: 'run.sh', html: 'index.html', css: 'styles.css', json: 'data.json',
+        rust: 'main.rs', go: 'main.go', java: 'Main.java',
+      }
+      filename = EXT[lang] || `file.${lang}`
+    }
+
+    if (filename && code.trim()) {
+      // Deduplicate — if same filename already extracted, append index
+      const existing = results.filter(r => r.filename === filename).length
+      if (existing > 0) filename = filename.replace(/(\.[^.]+)$/, `_${existing + 1}$1`)
+      results.push({ filename, content: code, language: lang })
+    }
+  }
+  return results
+}
+
 // ── Main AI Panel ────────────────────────────────────────────────────────────
 export default function AiPanel() {
   const {
@@ -566,8 +625,22 @@ Important rules for Agent mode:
     useStore.setState({ aiResponseStartTime: Date.now(), aiLastResponseTime: null })
 
     const assistantId = addAiMessage({
-      role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: skills.map(s => s.name)
+      role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: skills.map(s => s.name),
+      agentSteps: [], planSteps: [],
     })
+
+    // ── Cap system prompt to avoid token overflows ─────────────────────────
+    // Groq free tier TPM is very tight — keep system prompt lean
+    const MAX_SYSTEM_CHARS = 1200
+    if (systemInjected.length > MAX_SYSTEM_CHARS) {
+      systemInjected = systemInjected.slice(0, MAX_SYSTEM_CHARS)
+    }
+
+    // ── Only send last 6 messages of history (3 pairs) to stay within TPM ──
+    const trimmedHistory = aiMessages
+      .filter(m => m.content && m.role !== 'tool')
+      .slice(-6)
+      .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content.slice(0, 800) }))
 
     const trySidecar = (): Promise<boolean> => {
       return new Promise((resolve) => {
@@ -598,7 +671,7 @@ Important rules for Agent mode:
             const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
 
             ws.send(JSON.stringify({
-              messages: aiMessages.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })).concat([{ role: 'user', content: text }]),
+              messages: [...trimmedHistory, { role: 'user', content: text }],
               provider, api_key: key, model, host: settings.ollamaHost,
               system: systemInjected,
               mode,
@@ -692,34 +765,42 @@ Important rules for Agent mode:
         const key = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
         const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
 
-        const history = aiMessages.map(m => ({
-          role: m.role === 'assistant' ? 'assistant' : 'user',
-          content: m.content
-        }))
+        // Use same trimmed history to avoid token overflow
+        const history = trimmedHistory
 
         if (!key && provider !== 'ollama') {
-          throw new Error(`API key for ${provider.toUpperCase()} is missing. Please set it in Settings.`)
+          throw new Error(`API key for ${provider.toUpperCase()} is missing. Go to Settings (gear icon) and add your key.`)
         }
 
         if (provider === 'groq') {
           const GROQ_MAX: Record<string, number> = {
-            'llama3-70b-8192': 8192, 'llama3-8b-8192': 8192,
-            'mixtral-8x7b-32768': 32768, 'gemma2-9b-it': 8192,
-            'openai/gpt-oss-20b': 4096, 'default': 8192
+            'openai/gpt-oss-120b':  16000,   // 128K ctx; cap output at 16K to stay under TPM
+            'openai/gpt-oss-20b':   16000,
+            'llama-3.3-70b-versatile': 32768,
+            'llama-3.1-70b-versatile': 32768,
+            'llama-3.1-8b-instant':    8192,
+            'llama3-70b-8192':         8192,
+            'llama3-8b-8192':          8192,
+            'llama3-groq-70b-8192-tool-use-preview': 8192,
+            'mixtral-8x7b-32768':  32768,
+            'gemma2-9b-it':         8192,
+            'gemma-7b-it':          8192,
+            'default':              6000,
           }
-          const maxTokens = GROQ_MAX[model] ?? GROQ_MAX['default']
+          const groqModel = model || 'llama-3.3-70b-versatile'
+          const maxTokens = GROQ_MAX[groqModel] ?? GROQ_MAX['default']
           const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              model: model, stream: true, max_tokens: maxTokens,
+              model: groqModel, stream: true, max_tokens: maxTokens,
               messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
             })
           })
 
           if (!res.ok) {
             const errData = await res.json().catch(() => ({}))
-            throw new Error(errData.error?.message || `HTTP ${res.status}`)
+            throw new Error(errData.error?.message || `Groq HTTP ${res.status}`)
           }
 
           const reader = res.body!.getReader()
@@ -858,6 +939,38 @@ Important rules for Agent mode:
           } catch {}
         }
 
+        // ── Agent mode: extract code blocks and write files to disk ────────
+        // When the sidecar isn't running, the AI returns text with code blocks.
+        // We parse them out and create files via Electron IPC so SOMETHING lands on disk.
+        if (mode === 'agent' && window.api && folderPath) {
+          const agentSteps: AgentStep[] = []
+          const fileBlocks = extractFileBlocks(fullText)
+          for (const fb of fileBlocks) {
+            const fullPath = folderPath.replace(/[\\/]+$/, '') + '/' + fb.filename
+            try {
+              const res = await window.api.writeFile(fullPath, fb.content)
+              const step: AgentStep = {
+                id: Math.random().toString(),
+                tool: 'create_file',
+                input: fb.filename,
+                output: res.ok ? `✅ Created: ${fullPath}` : `❌ ${res.error}`,
+                status: res.ok ? 'success' : 'error',
+              }
+              agentSteps.push(step)
+            } catch (err: any) {
+              agentSteps.push({
+                id: Math.random().toString(), tool: 'create_file',
+                input: fb.filename, output: `❌ ${err.message}`, status: 'error',
+              })
+            }
+          }
+          if (agentSteps.length > 0) {
+            useStore.setState((s) => ({
+              aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, agentSteps } : m)
+            }))
+          }
+        }
+
         updateAiMessage(assistantId, fullText, false)
         if (planSteps.length > 0) {
           useStore.setState((s) => ({
@@ -882,7 +995,7 @@ Important rules for Agent mode:
 
       } catch (e: any) {
         console.error("Direct API failed:", e)
-        updateAiMessage(assistantId, `Error: ${e.message || e}. Please make sure your API keys are correct and you are connected to the network.`, false)
+        updateAiMessage(assistantId, `❌ ${e.message || e}`, false)
         setAiLoading(false)
         useStore.setState({ aiResponseStartTime: null })
       }
@@ -890,7 +1003,7 @@ Important rules for Agent mode:
 
     const success = await trySidecar()
     if (!success) {
-      console.warn("[AiPanel] Sidecar WebSocket failed/unreachable. Falling back to direct API...")
+      console.warn("[AiPanel] Sidecar unreachable — using direct API (no tool execution)")
       await runDirect()
     }
   }

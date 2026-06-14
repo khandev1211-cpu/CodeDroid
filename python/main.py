@@ -36,13 +36,19 @@ MAX_FIX_ATTEMPTS = 3
 
 # ─── Groq per-model token limits ─────────────────────────────────────────────
 GROQ_MAX_TOKENS = {
-    "llama3-70b-8192": 8000,
-    "llama3-8b-8192": 8000,
-    "mixtral-8x7b-32768": 8000,
-    "gemma2-9b-it": 8000,
-    "gemma-7b-it": 8000,
-    "openai/gpt-oss-20b": 4096,
-    "default": 8000,
+    "openai/gpt-oss-120b":      16000,   # 128K context, cap output sensibly
+    "openai/gpt-oss-20b":       16000,
+    "llama-3.3-70b-versatile":  32768,
+    "llama-3.1-70b-versatile":  32768,
+    "llama-3.1-8b-instant":      8192,
+    "llama3-70b-8192":           8192,   # decommissioned but handle gracefully
+    "llama3-8b-8192":            8192,
+    "llama3-groq-70b-8192-tool-use-preview": 8192,
+    "llama3-groq-8b-8192-tool-use-preview":  8192,
+    "mixtral-8x7b-32768":       32768,
+    "gemma2-9b-it":              8192,
+    "gemma-7b-it":               8192,
+    "default":                   6000,
 }
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -553,7 +559,15 @@ async def websocket_chat(ws: WebSocket):
                         # ── Groq: native function-calling agent loop ─────────────────────
                         current_messages = [{"role": "system", "content": system}] + req.messages
                         max_iterations = 8 if req.mode == "agent" else 1
-                        groq_model = req.model or "llama3-70b-8192"
+                        groq_model = req.model or "llama-3.3-70b-versatile"
+                        # compound-* are system agents, not direct /chat/completions models
+                        if groq_model.startswith("compound"):
+                            await ws.send_text(json.dumps({
+                                "type": "token",
+                                "text": f'⚠️ "{groq_model}" is a Groq system agent, not a direct chat model.\n\nPlease select a chat model like:\n• openai/gpt-oss-120b\n• llama-3.3-70b-versatile\n• mixtral-8x7b-32768'
+                            }))
+                            await ws.send_text(json.dumps({"type": "done"}))
+                            return
                         groq_max_tokens = GROQ_MAX_TOKENS.get(groq_model, GROQ_MAX_TOKENS["default"])
 
                         for i in range(max_iterations):
@@ -821,7 +835,7 @@ File content:
             r = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": m, "max_tokens": GROQ_MAX_TOKENS.get(m, GROQ_MAX_TOKENS["default"]),
+                json={"model": m, "max_tokens": GROQ_MAX_TOKENS.get(m, 8192),
                       "messages": [{"role": "system", "content": system}] + messages},
             )
             return r.json()["choices"][0]["message"]["content"]

@@ -118,7 +118,7 @@ export interface Settings {
 
 const defaultSettings: Settings = {
   groqKey: '', geminiKey: '', ollamaHost: 'http://localhost:11434',
-  claudeKey: '', groqModel: 'llama3-70b-8192', geminiModel: 'gemini-1.5-pro',
+  claudeKey: '', groqModel: 'llama-3.3-70b-versatile', geminiModel: 'gemini-1.5-pro',
   ollamaModel: 'llama3', claudeModel: 'claude-sonnet-4-20250514',
   activeProvider: 'groq', activeMode: 'ask',
   fontSize: 14, fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
@@ -279,7 +279,7 @@ export const useStore = create<AppStore>()(
       commandPaletteOpen: false, inlineAiOpen: false, inlineAiTarget: null,
       enhancerLoading: false,
       availableModels: {
-        groq: ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"],
+        groq: ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"],
         gemini: ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],
         claude: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229"],
         ollama: []
@@ -665,9 +665,51 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
               headers: { 'Authorization': `Bearer ${settings.groqKey}` }
             })
             const data = await res.json()
-            const models = data.data?.map((m: any) => m.id).sort() || []
-            if (models.length > 0) {
-              set((s) => ({ availableModels: { ...s.availableModels, groq: models } }))
+
+            // Groq's API returns ALL models including whisper, vision, openai/*, compound-beta.
+            // Only keep real text-generation chat models that work with /chat/completions.
+            const GROQ_CHAT_MODELS = [
+              'openai/gpt-oss-120b',          // OpenAI open-weight, 128K ctx, agentic
+              'openai/gpt-oss-20b',           // OpenAI open-weight, faster/smaller
+              'llama-3.3-70b-versatile',
+              'llama-3.1-70b-versatile',
+              'llama-3.1-8b-instant',
+              'llama3-70b-8192',
+              'llama3-8b-8192',
+              'mixtral-8x7b-32768',
+              'gemma2-9b-it',
+              'gemma-7b-it',
+              'llama3-groq-70b-8192-tool-use-preview',
+              'llama3-groq-8b-8192-tool-use-preview',
+            ]
+
+            const rawIds: string[] = data.data?.map((m: any) => m.id) || []
+
+            // Filter out non-chat models: audio transcription, TTS, vision-only, guard models
+            // openai/gpt-oss-* ARE valid Groq chat models — keep them
+            const fetchedSafe = rawIds.filter((id: string) =>
+              !id.includes('whisper') &&
+              !id.includes('-tts') &&
+              !id.includes('guard') &&
+              !id.startsWith('compound')   // compound-* are system agents, not direct chat models
+            )
+
+            // Merge: known safe list first, then any extra fetched ones, deduped
+            const merged = [
+              ...GROQ_CHAT_MODELS.filter(m => rawIds.includes(m) || rawIds.length === 0),
+              ...fetchedSafe.filter((m: string) => !GROQ_CHAT_MODELS.includes(m)),
+            ]
+
+            const models = merged.length > 0 ? merged : GROQ_CHAT_MODELS
+            set((s) => ({ availableModels: { ...s.availableModels, groq: models } }))
+
+            // If current model is not in the safe list, reset to best available
+            const currentModel = get().settings.groqModel
+            if (!models.includes(currentModel)) {
+              const fallback = models.find(m => m.includes('llama-3.3') || m.includes('llama3-70b')) || models[0]
+              if (fallback) {
+                set((s) => ({ settings: { ...s.settings, groqModel: fallback } }))
+              }
             }
           } else if (provider === 'gemini' && settings.geminiKey) {
             const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${settings.geminiKey}`)
