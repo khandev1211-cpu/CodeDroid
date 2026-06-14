@@ -2,6 +2,8 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import Editor, { OnMount } from '@monaco-editor/react'
 import { X, Circle, ChevronRight, SplitSquareHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
+import { applyErrorDecorations, clearErrorDecorations } from './ErrorDecorations'
+import ProblemsPanel from './ProblemsPanel'
 import './EditorArea.css'
 
 const LANG_ICON_COLOR: Record<string, string> = {
@@ -60,7 +62,8 @@ function Breadcrumbs() {
 export default function EditorArea() {
   const {
     openFiles, activeFileIndex, updateFileContent, saveFile,
-    settings, theme, setInlineAi, openNewFolder
+    settings, theme, setInlineAi, openNewFolder,
+    inlineErrors, clearInlineErrors,
   } = useStore()
   const editorRef = useRef<any>(null)
   const [editorReady, setEditorReady] = useState(false)
@@ -210,6 +213,24 @@ export default function EditorArea() {
     }
   }, [])
 
+  // Apply inline error decorations from agent auto-fix
+  useEffect(() => {
+    if (!editorRef.current) return
+    const monacoNs = (window as any).monaco
+    if (!monacoNs) return
+    const activeFile = openFiles[activeFileIndex]
+    if (!activeFile) { clearErrorDecorations(editorRef.current); return }
+    // Only show errors relevant to the current file
+    const fileErrors = inlineErrors.filter(e =>
+      e.file === activeFile.path || activeFile.path.endsWith(e.file)
+    )
+    if (fileErrors.length === 0) {
+      clearErrorDecorations(editorRef.current)
+    } else {
+      applyErrorDecorations(editorRef.current, monacoNs, fileErrors)
+    }
+  }, [inlineErrors, activeFileIndex, openFiles])
+
   // Update Monaco model language when file is renamed (extension changes)
   useEffect(() => {
     if (!editorRef.current || !file) return
@@ -265,6 +286,20 @@ export default function EditorArea() {
     )
   }
 
+  // goto-line event from ProblemsPanel click
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { line, column } = (e as CustomEvent).detail
+      if (editorRef.current) {
+        editorRef.current.revealLineInCenter(line)
+        editorRef.current.setPosition({ lineNumber: line, column: column ?? 1 })
+        editorRef.current.focus()
+      }
+    }
+    window.addEventListener('codedroid-goto-line', handler)
+    return () => window.removeEventListener('codedroid-goto-line', handler)
+  }, [])
+
   return (
     <div className="editor-area">
       <TabBar />
@@ -298,10 +333,12 @@ export default function EditorArea() {
             formatOnPaste: true,
             autoIndent: 'advanced',
             overviewRulerLanes: 3,
+            glyphMargin: true,
             scrollbar: { vertical: 'auto', horizontal: 'auto', verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
           }}
         />
       </div>
+      <ProblemsPanel />
     </div>
   )
 }

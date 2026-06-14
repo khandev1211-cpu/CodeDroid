@@ -819,3 +819,38 @@
 }
 
 .revert-btn:hover { color: var(--text); }
+
+/* ── Error paste banner ──────────────────────────────────────────────────────── */
+.error-paste-banner {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 0 12px 6px;
+  padding: 7px 12px;
+  background: rgba(255, 68, 68, 0.08);
+  border: 1px solid rgba(255, 68, 68, 0.3);
+  border-radius: 6px;
+  font-size: 12px; color: #ff6b6b;
+  animation: slideDown 0.15s ease;
+}
+@keyframes slideDown { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.banner-dismiss {
+  background: none; border: none; color: #ff6b6b; cursor: pointer;
+  font-size: 14px; padding: 0 2px; line-height: 1;
+}
+.ai-input-wrap.error-mode-input { border-color: rgba(255,68,68,0.4); }
+
+/* ── Enhanced agent step cards ───────────────────────────────────────────────── */
+.agent-log-entry.running  { border-color: var(--accent); }
+.agent-log-entry.success  { border-color: var(--git-added); }
+.agent-log-entry.error    { border-color: var(--git-deleted); }
+
+.agent-log-entry[data-tool="agent_step"] summary { cursor: default; }
+.agent-log-entry[data-tool="agent_step"] .log-tool {
+  color: var(--text);
+  font-weight: 400;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.agent-log-entry[data-tool="agent_step"].success .log-tool { color: var(--git-added); }
+.agent-log-entry[data-tool="agent_step"].error   .log-tool { color: var(--git-deleted); }
+.agent-log-entry[data-tool="agent_step"].running .log-tool { color: var(--accent); }

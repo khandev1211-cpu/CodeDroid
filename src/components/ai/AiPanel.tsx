@@ -390,17 +390,20 @@ export default function AiPanel() {
   const {
     aiMessages, aiLoading, sendAiMessage, clearAiMessages,
     settings, updateSettings, addAiMessage, updateAiMessage, setAiLoading,
-    enhancerLoading
+    enhancerLoading, setInlineErrors, clearInlineErrors,
+    addAgentTerminal, folderPath,
   } = useStore()
   const { addCheckpoint } = useHistoryStore()
 
-  const [input, setInput] = useState("")
+  const [input, setInput]             = useState("")
   const [showCommands, setShowCommands] = useState(false)
   const [detectedSkills, setDetectedSkills] = useState<Skill[]>([])
   const [showHistory, setShowHistory] = useState(false)
+  const [isErrorMode, setIsErrorMode] = useState(false)
+  const [errorBannerDismissed, setErrorBannerDismissed] = useState(false)
 
   const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const inputRef  = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [aiMessages, aiLoading])
 
@@ -408,6 +411,121 @@ export default function AiPanel() {
   useEffect(() => {
     setDetectedSkills(detectSkills(input))
   }, [input])
+
+  // Paste detection — check if pasted text looks like an error report
+  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = e.clipboardData.getData('text')
+    if (!pasted || pasted.length < 20) return
+    try {
+      const res = await fetch('http://127.0.0.1:8765/detect-error', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: pasted }),
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      if (data.is_error_paste) {
+        setIsErrorMode(true)
+        setErrorBannerDismissed(false)
+        // Auto-switch to agent mode for fix
+        updateSettings({ activeMode: 'agent' })
+      }
+    } catch { /* sidecar not running — ignore */ }
+  }
+
+  // Agent-Fix WebSocket: run a command, auto-fix on error
+  const runAgentFix = async (command: string, filePath?: string) => {
+    const provider  = settings.activeProvider
+    const apiKey    = provider === 'groq' ? settings.groqKey
+      : provider === 'gemini' ? settings.geminiKey
+      : provider === 'claude' ? settings.claudeKey : ''
+    const model = provider === 'groq' ? settings.groqModel
+      : provider === 'gemini' ? settings.geminiModel
+      : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
+    const workspace = folderPath || ''
+
+    // Open / reuse agent terminal tab
+    addAgentTerminal(workspace)
+
+    setAiLoading(true)
+    const assistantId = addAiMessage({
+      role: 'assistant', content: '', provider, isStreaming: true,
+      mode: 'agent', agentSteps: [], planSteps: [],
+    })
+
+    let fullText = ''
+    const agentSteps: AgentStep[] = []
+
+    return new Promise<void>((resolve) => {
+      try {
+        const ws = new WebSocket('ws://127.0.0.1:8765/ws/agent-fix')
+
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            command, workspace,
+            file_path: filePath || '',
+            error_text: '',
+            provider, api_key: apiKey, model,
+            host: settings.ollamaHost,
+          }))
+        }
+
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data)
+
+          if (data.type === 'step') {
+            // Each step message → new agent step card
+            const step: AgentStep = {
+              id: Math.random().toString(),
+              tool: 'agent_step',
+              input: data.text,
+              status: data.text.includes('✅') ? 'success'
+                    : data.text.includes('❌') ? 'error' : 'running',
+            }
+            agentSteps.push(step)
+            useStore.setState((s) => ({
+              aiMessages: s.aiMessages.map(m =>
+                m.id === assistantId ? { ...m, agentSteps: [...agentSteps] } : m
+              )
+            }))
+          } else if (data.type === 'token') {
+            fullText += data.text
+            updateAiMessage(assistantId, fullText, true)
+          } else if (data.type === 'error_detected') {
+            const err = data.error
+            if (err?.has_error && err.file_path) {
+              setInlineErrors([{
+                file: err.file_path,
+                line: err.line_number || 1,
+                column: err.column,
+                errorType: err.error_type || 'error',
+                message: err.error_message || '',
+              }])
+            }
+          } else if (data.type === 'fix_applied') {
+            // Clear decorations after fix applied
+            clearInlineErrors()
+          } else if (data.type === 'success') {
+            updateAiMessage(assistantId, fullText, false)
+            setAiLoading(false)
+            ws.close()
+            resolve()
+          } else if (data.type === 'failed') {
+            updateAiMessage(assistantId, fullText, false)
+            setAiLoading(false)
+            ws.close()
+            resolve()
+          } else if (data.type === 'done') {
+            updateAiMessage(assistantId, fullText, false)
+            setAiLoading(false)
+            ws.close()
+            resolve()
+          }
+        }
+
+        ws.onerror = () => { setAiLoading(false); ws.close(); resolve() }
+      } catch { setAiLoading(false); resolve() }
+    })
+  }
 
   const send = async () => {
     const text = input.trim()
@@ -584,11 +702,17 @@ Important rules for Agent mode:
         }
 
         if (provider === 'groq') {
+          const GROQ_MAX: Record<string, number> = {
+            'llama3-70b-8192': 8192, 'llama3-8b-8192': 8192,
+            'mixtral-8x7b-32768': 32768, 'gemma2-9b-it': 8192,
+            'openai/gpt-oss-20b': 4096, 'default': 8192
+          }
+          const maxTokens = GROQ_MAX[model] ?? GROQ_MAX['default']
           const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              model: model, stream: true,
+              model: model, stream: true, max_tokens: maxTokens,
               messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
             })
           })
@@ -632,6 +756,7 @@ Important rules for Agent mode:
           fullText = data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response'
           updateAiMessage(assistantId, fullText, true)
         } else if (provider === 'claude') {
+          // Streaming SSE for Claude direct fallback
           const res = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -642,6 +767,7 @@ Important rules for Agent mode:
             body: JSON.stringify({
               model: model,
               max_tokens: 4096,
+              stream: true,
               system: systemInjected,
               messages: history.concat([{ role: 'user', content: text }])
             })
@@ -652,9 +778,23 @@ Important rules for Agent mode:
             throw new Error(errData.error?.message || `HTTP ${res.status}`)
           }
 
-          const data = await res.json()
-          fullText = data.content?.[0]?.text || ''
-          updateAiMessage(assistantId, fullText, true)
+          const reader = res.body!.getReader()
+          const dec = new TextDecoder()
+          while (true) {
+            const { done, value } = await reader.read(); if (done) break
+            const chunk = dec.decode(value)
+            for (const line of chunk.split('\n')) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const d = JSON.parse(line.slice(6))
+                  if (d.type === 'content_block_delta') {
+                    fullText += d.delta?.text || ''
+                    updateAiMessage(assistantId, fullText, true)
+                  }
+                } catch {}
+              }
+            }
+          }
         } else if (provider === 'ollama') {
           if (window.api && window.api.ollamaChat) {
             window.api.removeOllamaListeners()
@@ -820,6 +960,14 @@ Important rules for Agent mode:
         <div ref={bottomRef} />
       </div>
 
+      {/* Error paste banner */}
+      {isErrorMode && !errorBannerDismissed && (
+        <div className="error-paste-banner">
+          <span>🔍 Error detected — entering fix mode</span>
+          <button className="banner-dismiss" onClick={() => { setIsErrorMode(false); setErrorBannerDismissed(true) }}>✕</button>
+        </div>
+      )}
+
       {/* Slash commands */}
       {showCommands && filteredCmds.length > 0 && (
         <div className="slash-popup">
@@ -844,11 +992,14 @@ Important rules for Agent mode:
 
       {/* Input area */}
       <div className="ai-input-area">
-        <div className={`ai-input-wrap ${enhancerLoading ? 'enhancing' : ''}`}>
+        <div className={`ai-input-wrap ${enhancerLoading ? 'enhancing' : ''} ${isErrorMode ? 'error-mode-input' : ''}`}>
           <textarea ref={inputRef} className="ai-input"
-            placeholder={`Ask AI in ${settings.activeMode || 'ask'} mode...`}
+            placeholder={isErrorMode
+              ? `Paste the error here or describe what to fix...`
+              : `Ask AI in ${settings.activeMode || 'ask'} mode...`}
             value={input}
             onChange={e => { setInput(e.target.value); setShowCommands(e.target.value.startsWith("/") && e.target.value.length > 0) }}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown} rows={4} />
 
           {enhancerLoading && (

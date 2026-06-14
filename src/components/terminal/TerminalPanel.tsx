@@ -143,8 +143,9 @@ export default function TerminalPanel() {
           {terminalTabs.map(tab => (
             <div
               key={tab.id}
-              className={`term-tab ${activeTerminalTab === tab.id ? 'active' : ''}`}
+              className={`term-tab ${activeTerminalTab === tab.id ? 'active' : ''} ${tab.isAgentTab ? 'agent-tab' : ''}`}
               onClick={() => setActiveTerminalTab(tab.id)}
+              title={tab.isAgentTab ? '🤖 Agent Terminal' : tab.name}
             >
               {tab.name}
               {terminalTabs.length > 1 && (

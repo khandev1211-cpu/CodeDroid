@@ -25,6 +25,16 @@ export interface AgentStep {
   input: string
   output?: string
   status: 'running' | 'success' | 'error'
+  exitCode?: number
+  hadError?: boolean
+}
+
+export interface InlineError {
+  file: string
+  line: number
+  column?: number
+  errorType: string
+  message: string
 }
 
 export interface PlanStep {
@@ -69,6 +79,7 @@ export interface TerminalTabDef {
   name: string
   pid?: number
   cwd?: string
+  isAgentTab?: boolean
 }
 
 // ─── Settings interface ───────────────────────────────────────────────────────
@@ -140,6 +151,8 @@ interface AppStore {
   agentTotalSteps: number
   agentCurrentTool: string
   agentWebSocket: WebSocket | null
+  agentTerminalId: string | null       // ID of the dedicated 🤖 Agent terminal tab
+  inlineErrors: InlineError[]          // errors to show in Monaco decorations
 
   // Git
   gitFiles: GitFileStatus[]
@@ -192,6 +205,9 @@ interface AppStore {
   // Actions: Agent
   setAgentRunning: (running: boolean) => void
   setAgentPaused: (paused: boolean) => void
+  setAgentTerminalId: (id: string | null) => void
+  setInlineErrors: (errors: InlineError[]) => void
+  clearInlineErrors: () => void
   setAgentStatus: (step: number, total: number, tool: string) => void
   setAgentWebSocket: (ws: WebSocket | null) => void
   pauseAgent: () => void
@@ -216,6 +232,7 @@ interface AppStore {
 
   // Actions: Terminal
   addTerminalTab: (cwd?: string) => void
+  addAgentTerminal: (cwd?: string) => string   // returns tab id
   removeTerminalTab: (id: string) => void
   setActiveTerminalTab: (id: string) => void
 
@@ -252,6 +269,7 @@ export const useStore = create<AppStore>()(
       aiResponseStartTime: null, aiLastResponseTime: null,
       agentRunning: false, agentPaused: false, agentCurrentStep: 0,
       agentTotalSteps: 0, agentCurrentTool: '', agentWebSocket: null,
+      agentTerminalId: null, inlineErrors: [],
       gitFiles: [], gitBranch: 'main', gitLog: [], commitMessage: '',
       searchQuery: '', searchResults: [], searchLoading: false, replaceQuery: '',
       terminalTabs: [{ id: 'term_1', name: 'Terminal 1' }], activeTerminalTab: 'term_1',
@@ -377,6 +395,9 @@ export const useStore = create<AppStore>()(
       // ── Agent actions ──────────────────────────────────────────────────────
       setAgentRunning: (running) => set({ agentRunning: running }),
       setAgentPaused: (paused) => set({ agentPaused: paused }),
+      setAgentTerminalId: (id) => set({ agentTerminalId: id }),
+      setInlineErrors: (errors) => set({ inlineErrors: errors }),
+      clearInlineErrors: () => set({ inlineErrors: [] }),
       setAgentStatus: (step, total, tool) => set({ agentCurrentStep: step, agentTotalSteps: total, agentCurrentTool: tool }),
       setAgentWebSocket: (ws) => set({ agentWebSocket: ws }),
       pauseAgent: () => {
@@ -761,6 +782,21 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
           activeTerminalTab: id,
         }
       }),
+
+      addAgentTerminal: (cwd?) => {
+        const existing = get().agentTerminalId
+        if (existing) {
+          set({ activeTerminalTab: existing })
+          return existing
+        }
+        const id = `agent_term_${Date.now()}`
+        set((s) => ({
+          terminalTabs: [...s.terminalTabs, { id, name: '🤖 Agent', cwd: cwd || s.folderPath || undefined, isAgentTab: true }],
+          activeTerminalTab: id,
+          agentTerminalId: id,
+        }))
+        return id
+      },
 
       removeTerminalTab: (id) => set((s) => {
         const tabs = s.terminalTabs.filter(t => t.id !== id)

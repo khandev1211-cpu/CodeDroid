@@ -18,17 +18,31 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Local error detection module
+try:
+    from error_detector import detect_error, is_error_paste
+except ImportError:
+    def detect_error(output: str) -> dict:
+        return {"has_error": False, "error_type": None, "error_message": None,
+                "file_path": None, "line_number": None, "column": None, "stack_trace": None}
+    def is_error_paste(text: str) -> bool:
+        return False
+
 app = FastAPI(title="CodeDroid AI Sidecar", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ─── Agent auto-fix constants ──────────────────────────────────────────────────
+MAX_FIX_ATTEMPTS = 3
+
 # ─── Groq per-model token limits ─────────────────────────────────────────────
 GROQ_MAX_TOKENS = {
-    "llama3-70b-8192": 8192,
-    "llama3-8b-8192": 8192,
-    "mixtral-8x7b-32768": 32768,
-    "gemma2-9b-it": 8192,
-    "gemma-7b-it": 8192,
-    "default": 8192,
+    "llama3-70b-8192": 8000,
+    "llama3-8b-8192": 8000,
+    "mixtral-8x7b-32768": 8000,
+    "gemma2-9b-it": 8000,
+    "gemma-7b-it": 8000,
+    "openai/gpt-oss-20b": 4096,
+    "default": 8000,
 }
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -253,12 +267,28 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
         elif tool_name == "run_command":
             cwd = _resolve_path(args.get("cwd", "")) or _workspace_root or None
-            result = subprocess.run(
-                args["command"], shell=True, capture_output=True, text=True,
-                cwd=cwd, timeout=30
+            proc = await asyncio.create_subprocess_shell(
+                args["command"],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
             )
-            out = result.stdout + result.stderr
-            return out[:4000] if out else "(no output)"
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return json.dumps({"stdout": "", "stderr": "Command timed out after 60s", "exit_code": -1, "had_error": True})
+            stdout = stdout_b.decode(errors="replace")
+            stderr = stderr_b.decode(errors="replace")
+            combined = (stdout + stderr)[:4000]
+            had_error = (proc.returncode != 0) or bool(stderr.strip())
+            return json.dumps({
+                "stdout": stdout[:2000],
+                "stderr": stderr[:2000],
+                "exit_code": proc.returncode,
+                "had_error": had_error,
+                "output": combined,
+            })
 
         elif tool_name == "run_python":
             import tempfile
@@ -305,6 +335,16 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
 # Global workspace root — updated by /set-workspace when user opens a folder
 _workspace_root: str = ""
+
+@app.post("/detect-error")
+async def detect_error_endpoint(body: dict):
+    """Detect errors in text and return structured info. Used by AiPanel paste detection."""
+    text = body.get("text", "")
+    return {
+        "is_error_paste": is_error_paste(text),
+        "error": detect_error(text),
+    }
+
 
 @app.get("/health")
 async def health():
@@ -746,6 +786,265 @@ async def websocket_chat(ws: WebSocket):
 
     except WebSocketDisconnect:
         pass
+
+
+# ─── Auto-Fix Helpers ─────────────────────────────────────────────────────────
+
+async def _get_ai_fix(
+    api_key: str, provider: str, model: str, host: str,
+    file_path: str, file_content: str, error: dict, command: str,
+) -> str:
+    """Call the AI to get a surgical fix for a broken file. Returns corrected file content."""
+    fix_prompt = f"""You are an expert debugger. Fix the following file.
+
+File: {file_path}
+Line: {error.get('line_number', 'unknown')}
+Error type: {error.get('error_type', 'unknown')}
+Error message: {error.get('error_message', 'unknown')}
+Command run: {command}
+
+Rules:
+1. Identify the exact root cause
+2. Make the minimal surgical fix — change only what is broken
+3. Do NOT refactor, rename, or restructure anything else
+4. Return ONLY the corrected full file content — no explanation, no markdown fences
+
+File content:
+{file_content}"""
+
+    messages = [{"role": "user", "content": fix_prompt}]
+    system = "You are an expert debugger. Return ONLY corrected file content, nothing else."
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        if provider == "groq":
+            m = model or "llama3-70b-8192"
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": m, "max_tokens": GROQ_MAX_TOKENS.get(m, GROQ_MAX_TOKENS["default"]),
+                      "messages": [{"role": "system", "content": system}] + messages},
+            )
+            return r.json()["choices"][0]["message"]["content"]
+
+        elif provider == "claude":
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model or "claude-sonnet-4-20250514", "max_tokens": 4096,
+                      "system": system, "messages": messages},
+            )
+            return r.json()["content"][0]["text"]
+
+        elif provider == "gemini":
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-1.5-pro'}:generateContent",
+                params={"key": api_key},
+                json={"system_instruction": {"parts": [{"text": system}]},
+                      "contents": [{"role": "user", "parts": [{"text": fix_prompt}]}]},
+            )
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+        else:  # ollama
+            r = await client.post(f"{host}/api/chat", json={
+                "model": model or "llama3", "stream": False,
+                "messages": [{"role": "system", "content": system}] + messages,
+            })
+            return r.json()["message"]["content"]
+
+
+async def _run_command_capture(command: str, workspace: str) -> dict:
+    """Run a shell command and return structured result with error detection."""
+    cwd = workspace or _workspace_root or None
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"stdout": "", "stderr": "Timed out", "exit_code": -1, "had_error": True}
+    stdout = stdout_b.decode(errors="replace")
+    stderr = stderr_b.decode(errors="replace")
+    combined = stdout + stderr
+    had_error = (proc.returncode != 0) or bool(stderr.strip())
+    return {
+        "stdout": stdout[:3000],
+        "stderr": stderr[:3000],
+        "exit_code": proc.returncode,
+        "had_error": had_error,
+        "output": combined[:4000],
+    }
+
+
+# ─── /ws/agent-fix WebSocket ──────────────────────────────────────────────────
+class AgentFixRequest(BaseModel):
+    command: str                  # The command to run (and re-run after fixes)
+    workspace: str = ""           # Workspace root path
+    file_path: str = ""           # Optional: specific file to fix (if known)
+    error_text: str = ""          # Optional: pre-pasted error text
+    provider: str = "groq"
+    api_key: str = ""
+    model: str = ""
+    host: str = "http://localhost:11434"
+
+
+@app.websocket("/ws/agent-fix")
+async def websocket_agent_fix(ws: WebSocket):
+    """
+    Autonomous error-detect → auto-fix → re-run WebSocket.
+
+    Client sends AgentFixRequest JSON.
+    Server emits a stream of typed events:
+      { type: "step",    text: str }          — live step card update
+      { type: "token",   text: str }          — streaming report tokens
+      { type: "error_detected", error: dict } — structured error info
+      { type: "fix_applied", attempt: int, file: str } — fix written to disk
+      { type: "success", attempts: int, output: str }  — all done
+      { type: "failed",  attempts: int, report: str }  — gave up after MAX
+      { type: "done" }                        — stream finished
+    """
+    await ws.accept()
+    try:
+        raw = await ws.receive_text()
+        req = AgentFixRequest(**json.loads(raw))
+        workspace = req.workspace or _workspace_root or ""
+
+        async def emit(type_: str, **kwargs):
+            await ws.send_text(json.dumps({"type": type_, **kwargs}))
+
+        # ── Step 1: Run the command (or use pre-pasted error) ─────────────────
+        if req.error_text:
+            run_result = {
+                "stdout": "", "stderr": req.error_text,
+                "exit_code": 1, "had_error": True, "output": req.error_text,
+            }
+            await emit("step", text=f"⚡ Analyzing pasted error...")
+        else:
+            await emit("step", text=f"⚡ run_command → `{req.command}`")
+            run_result = await _run_command_capture(req.command, workspace)
+            exit_icon = "✅" if not run_result["had_error"] else "❌"
+            await emit("step", text=f"   ↳ {exit_icon} Exit code {run_result['exit_code']}")
+
+        # ── Step 2: Detect error ───────────────────────────────────────────────
+        if not run_result["had_error"]:
+            await emit("success", attempts=0, output=run_result["output"])
+            await emit("done")
+            return
+
+        error = detect_error(run_result["output"])
+        if not error["has_error"]:
+            # Exit code was non-zero but no recognized error pattern
+            await emit("step", text=f"   ↳ ⚠️ Non-zero exit but no parseable error. Output:\n{run_result['output'][:500]}")
+            await emit("failed", attempts=0, report=run_result["output"])
+            await emit("done")
+            return
+
+        await emit("error_detected", error=error)
+        await emit("step", text=f"🔍 {error['error_type']} detected — {error['error_message'] or ''}")
+        if error.get("line_number"):
+            await emit("step", text=f"   ↳ {error.get('file_path', 'unknown file')} line {error['line_number']}")
+
+        # ── Determine which file to fix ────────────────────────────────────────
+        file_path = req.file_path or error.get("file_path") or ""
+        if file_path and not Path(file_path).is_absolute() and workspace:
+            file_path = str(Path(workspace) / file_path)
+
+        if not file_path or not Path(file_path).exists():
+            await emit("step", text=f"⚠️ Cannot locate source file to fix. Stopping.")
+            await emit("failed", attempts=0, report=run_result["output"])
+            await emit("done")
+            return
+
+        # ── Auto-fix loop ──────────────────────────────────────────────────────
+        current_error = error
+        for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+            await emit("step", text=f"📖 read_file → {Path(file_path).name}")
+            file_content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            await emit("step", text=f"   ↳ {len(file_content.splitlines())} lines read")
+
+            await emit("step", text=f"🔧 Applying fix attempt {attempt}/{MAX_FIX_ATTEMPTS}...")
+            try:
+                fixed_content = await _get_ai_fix(
+                    api_key=req.api_key, provider=req.provider,
+                    model=req.model, host=req.host,
+                    file_path=file_path, file_content=file_content,
+                    error=current_error, command=req.command,
+                )
+                # Strip any accidental markdown fences
+                if fixed_content.strip().startswith("```"):
+                    lines = fixed_content.strip().splitlines()
+                    fixed_content = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+            except Exception as e:
+                await emit("step", text=f"   ↳ ❌ AI fix request failed: {e}")
+                break
+
+            Path(file_path).write_text(fixed_content, encoding="utf-8")
+            await emit("fix_applied", attempt=attempt, file=file_path)
+            # Rough diff summary
+            old_lines = len(file_content.splitlines())
+            new_lines = len(fixed_content.splitlines())
+            await emit("step", text=f"   ↳ {old_lines}→{new_lines} lines written")
+
+            # ── Re-run ────────────────────────────────────────────────────────
+            await emit("step", text=f"⚡ run_command → {req.command}  [retry {attempt}]")
+            run_result = await _run_command_capture(req.command, workspace)
+            if not run_result["had_error"]:
+                await emit("step", text=f"   ↳ ✅ Exit code 0 — fixed!")
+
+                # ── Post-fix report ───────────────────────────────────────────
+                report = (
+                    f"✅ Fixed successfully after {attempt} attempt{'s' if attempt > 1 else ''}\n\n"
+                    f"### 🔍 What Was Wrong\n"
+                    f"{current_error['error_type']} on line {current_error.get('line_number', '?')} "
+                    f"of `{Path(file_path).name}` — {current_error['error_message'] or ''}\n\n"
+                    f"### 🔧 What I Fixed\n"
+                    f"Rewrote the broken section of `{Path(file_path).name}` to resolve the {current_error['error_type']}.\n\n"
+                    f"### 📁 Files Changed\n"
+                    f"- `{file_path}`\n\n"
+                    f"### ▶ Re-run Result\n"
+                    f"```\n$ {req.command}\n{run_result['output'][:500]}\n✅ Exit code 0 — no errors\n```"
+                )
+                # Stream report as tokens
+                for chunk in [report[i:i+80] for i in range(0, len(report), 80)]:
+                    await emit("token", text=chunk)
+
+                await emit("success", attempts=attempt, output=run_result["output"])
+                await emit("done")
+                return
+
+            # Still broken — re-detect error for next attempt
+            current_error = detect_error(run_result["output"])
+            if not current_error["has_error"]:
+                current_error = {"error_type": "unknown", "error_message": run_result["output"][:200],
+                                 "line_number": None, "file_path": file_path}
+            await emit("step", text=f"   ↳ ❌ Still failing — {current_error.get('error_message', '')[:80]}")
+
+        # ── All attempts exhausted ─────────────────────────────────────────────
+        debug_report = (
+            f"❌ Could not fix after {MAX_FIX_ATTEMPTS} attempts.\n\n"
+            f"**Error type:** {current_error.get('error_type')}\n"
+            f"**File:** {file_path}\n"
+            f"**Line:** {current_error.get('line_number', 'unknown')}\n\n"
+            f"**Last output:**\n```\n{run_result['output'][:1000]}\n```\n\n"
+            f"Please review the file manually."
+        )
+        for chunk in [debug_report[i:i+80] for i in range(0, len(debug_report), 80)]:
+            await emit("token", text=chunk)
+
+        await emit("failed", attempts=MAX_FIX_ATTEMPTS, report=run_result["output"])
+        await emit("done")
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+            await ws.send_text(json.dumps({"type": "done"}))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
