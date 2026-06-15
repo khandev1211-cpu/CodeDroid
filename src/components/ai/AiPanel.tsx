@@ -629,18 +629,32 @@ Important rules for Agent mode:
       agentSteps: [], planSteps: [],
     })
 
-    // ── Cap system prompt to avoid token overflows ─────────────────────────
-    // Groq free tier TPM is very tight — keep system prompt lean
-    const MAX_SYSTEM_CHARS = 1200
+    // ── Token budget for Groq free tier (8000 TPM total = input + output) ──
+    // Rough estimate: 1 token ≈ 4 chars
+    // Budget: 8000 TPM total → reserve 2000 for output → 6000 tokens for input
+    // 6000 tokens × 4 chars = 24000 chars max input
+    // System prompt cap: 800 chars (~200 tokens)
+    // History: last 4 messages, 400 chars each (~100 tokens each = 400 tokens)
+    // User message: up to 2000 chars (~500 tokens)
+    // Total input estimate: 200 + 400 + 500 = ~1100 tokens → safe under 6000
+
+    const MAX_SYSTEM_CHARS   = 800   // ~200 tokens
+    const MAX_HISTORY_MSGS   = 4     // last 2 pairs
+    const MAX_HISTORY_CHARS  = 400   // per message
+    const MAX_OUTPUT_TOKENS  = 2000  // safe output budget under free tier
+
     if (systemInjected.length > MAX_SYSTEM_CHARS) {
       systemInjected = systemInjected.slice(0, MAX_SYSTEM_CHARS)
     }
 
-    // ── Only send last 6 messages of history (3 pairs) to stay within TPM ──
+    // Only send last N messages, each capped at MAX_HISTORY_CHARS
     const trimmedHistory = aiMessages
       .filter(m => m.content && m.role !== 'tool')
-      .slice(-6)
-      .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content.slice(0, 800) }))
+      .slice(-MAX_HISTORY_MSGS)
+      .map(m => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content.slice(0, MAX_HISTORY_CHARS),
+      }))
 
     const trySidecar = (): Promise<boolean> => {
       return new Promise((resolve) => {
@@ -773,19 +787,21 @@ Important rules for Agent mode:
         }
 
         if (provider === 'groq') {
+          // All values = max OUTPUT tokens. Free tier TPM = 8000 (input+output).
+          // We keep output ≤ 2000 so input has room. Users on Dev tier get 100k+ TPM.
           const GROQ_MAX: Record<string, number> = {
-            'openai/gpt-oss-120b':  16000,   // 128K ctx; cap output at 16K to stay under TPM
-            'openai/gpt-oss-20b':   16000,
-            'llama-3.3-70b-versatile': 32768,
-            'llama-3.1-70b-versatile': 32768,
-            'llama-3.1-8b-instant':    8192,
-            'llama3-70b-8192':         8192,
-            'llama3-8b-8192':          8192,
-            'llama3-groq-70b-8192-tool-use-preview': 8192,
-            'mixtral-8x7b-32768':  32768,
-            'gemma2-9b-it':         8192,
-            'gemma-7b-it':          8192,
-            'default':              6000,
+            'openai/gpt-oss-120b':               2000,
+            'openai/gpt-oss-20b':                2000,
+            'llama-3.3-70b-versatile':           2000,
+            'llama-3.1-70b-versatile':           2000,
+            'llama-3.1-8b-instant':              2000,
+            'llama3-70b-8192':                   2000,
+            'llama3-8b-8192':                    2000,
+            'llama3-groq-70b-8192-tool-use-preview': 2000,
+            'mixtral-8x7b-32768':                2000,
+            'gemma2-9b-it':                      2000,
+            'gemma-7b-it':                       2000,
+            'default':                           1500,
           }
           const groqModel = model || 'llama-3.3-70b-versatile'
           const maxTokens = GROQ_MAX[groqModel] ?? GROQ_MAX['default']

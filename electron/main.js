@@ -174,8 +174,8 @@ ipcMain.handle('fs:reveal', async (_, itemPath) => {
 
 // ─── Settings Store ───────────────────────────────────────────────────────────
 let Store
-try { Store = require('electron-store') } catch {}
-const store = Store ? new Store() : { get: () => undefined, set: () => {}, store: {} }
+try { Store = require('electron-store') } catch { }
+const store = Store ? new Store() : { get: () => undefined, set: () => { }, store: {} }
 
 ipcMain.handle('store:get', (_, key) => store.get(key))
 ipcMain.handle('store:set', (_, key, value) => store.set(key, value))
@@ -225,7 +225,7 @@ ipcMain.handle('search:in-files', async (_, folder, query, opts = {}) => {
             const re = new RegExp(query, caseSensitive ? '' : 'i')
             const m = re.exec(line)
             if (m) matchStart = m.index
-          } catch {}
+          } catch { }
         } else {
           matchStart = caseSensitive ? line.indexOf(query) : line.toLowerCase().indexOf(query.toLowerCase())
         }
@@ -242,7 +242,7 @@ ipcMain.handle('search:in-files', async (_, folder, query, opts = {}) => {
 
 // ─── Terminal (node-pty) ──────────────────────────────────────────────────────
 let pty
-try { pty = require('node-pty') } catch {}
+try { pty = require('node-pty') } catch { }
 const terminals = new Map()
 
 ipcMain.handle('term:create', (event, id, cwd) => {

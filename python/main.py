@@ -36,19 +36,22 @@ MAX_FIX_ATTEMPTS = 3
 
 # ─── Groq per-model token limits ─────────────────────────────────────────────
 GROQ_MAX_TOKENS = {
-    "openai/gpt-oss-120b":      16000,   # 128K context, cap output sensibly
-    "openai/gpt-oss-20b":       16000,
-    "llama-3.3-70b-versatile":  32768,
-    "llama-3.1-70b-versatile":  32768,
-    "llama-3.1-8b-instant":      8192,
-    "llama3-70b-8192":           8192,   # decommissioned but handle gracefully
-    "llama3-8b-8192":            8192,
-    "llama3-groq-70b-8192-tool-use-preview": 8192,
-    "llama3-groq-8b-8192-tool-use-preview":  8192,
-    "mixtral-8x7b-32768":       32768,
-    "gemma2-9b-it":              8192,
-    "gemma-7b-it":               8192,
-    "default":                   6000,
+    # Output token limits tuned for Groq free tier (8000 TPM total = input + output).
+    # We cap output at 2000 so input messages have ~6000 tokens of headroom.
+    # Users on paid Dev tier (100k+ TPM) can raise these manually.
+    "openai/gpt-oss-120b":               2000,
+    "openai/gpt-oss-20b":                2000,
+    "llama-3.3-70b-versatile":           2000,
+    "llama-3.1-70b-versatile":           2000,
+    "llama-3.1-8b-instant":              2000,
+    "llama3-70b-8192":                   2000,
+    "llama3-8b-8192":                    2000,
+    "llama3-groq-70b-8192-tool-use-preview": 2000,
+    "llama3-groq-8b-8192-tool-use-preview":  2000,
+    "mixtral-8x7b-32768":                2000,
+    "gemma2-9b-it":                      2000,
+    "gemma-7b-it":                       2000,
+    "default":                           1500,
 }
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -538,6 +541,26 @@ async def websocket_chat(ws: WebSocket):
             if skill_context:
                 system = f"{system}\n\nUSE THESE SPECIALIZED SKILLS AND RULES:\n{skill_context}"
 
+            # ── Groq free tier: 8000 TPM (input + output combined) ────────────
+            # Cap system prompt at 800 chars (~200 tokens)
+            # Trim history to last 4 messages, 400 chars each (~400 tokens)
+            # Output capped at 2000 tokens → total ~3100 tokens → safely under 8000
+            MAX_SYS_CHARS  = 800
+            MAX_HIST_MSGS  = 4
+            MAX_HIST_CHARS = 400
+
+            if len(system) > MAX_SYS_CHARS:
+                system = system[:MAX_SYS_CHARS]
+
+            # Trim history for Groq — applied per-provider below
+            def trim_messages_for_groq(messages: list) -> list:
+                trimmed = [m for m in messages if m.get("content") and m.get("role") != "tool"]
+                trimmed = trimmed[-MAX_HIST_MSGS:]
+                return [
+                    {**m, "content": m["content"][:MAX_HIST_CHARS] if isinstance(m["content"], str) else m["content"]}
+                    for m in trimmed
+                ]
+
             try:
                 # Tool descriptions for prompt-injection providers (Ollama, Gemini)
                 TOOLS_DESCRIPTION = "\n".join(
@@ -557,7 +580,8 @@ async def websocket_chat(ws: WebSocket):
 
                     if req.provider == "groq":
                         # ── Groq: native function-calling agent loop ─────────────────────
-                        current_messages = [{"role": "system", "content": system}] + req.messages
+                        groq_history = trim_messages_for_groq(req.messages)
+                        current_messages = [{"role": "system", "content": system}] + groq_history
                         max_iterations = 8 if req.mode == "agent" else 1
                         groq_model = req.model or "llama-3.3-70b-versatile"
                         # compound-* are system agents, not direct /chat/completions models
