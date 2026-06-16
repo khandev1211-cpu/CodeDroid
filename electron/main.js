@@ -109,12 +109,48 @@ ipcMain.handle('fs:create-dir', async (_, dirPath) => {
 
 ipcMain.handle('fs:rename', async (_, oldPath, newPath) => {
   try {
+    // Verify source exists before doing anything
+    try { await fs.promises.access(oldPath) }
+    catch { return { ok: false, error: 'ENOENT', message: `Source not found: ${path.basename(oldPath)}` } }
+
+    // If dest already exists, return error — never overwrite silently
+    try {
+      await fs.promises.access(newPath)
+      return { ok: false, error: 'EEXIST', message: `'${path.basename(newPath)}' already exists in this location` }
+    } catch { /* good — dest does not exist */ }
+
+    // fs.promises.rename handles both files AND folders atomically
     await fs.promises.rename(oldPath, newPath)
-    return { ok: true }
+    return { ok: true, oldPath, newPath }
   } catch (e) {
-    if (e.code === 'EEXIST') return { ok: false, error: 'EEXIST', message: `'${path.basename(newPath)}' already exists in this location` }
+    // CRITICAL: never delete on rename failure — just return error
     return { ok: false, error: e.code, message: e.message }
   }
+})
+
+// Recursive directory copy helper
+async function copyDirRecursive(src, dest) {
+  await fs.promises.mkdir(dest, { recursive: true })
+  const entries = await fs.promises.readdir(src, { withFileTypes: true })
+  for (const entry of entries) {
+    const srcChild  = path.join(src,  entry.name)
+    const destChild = path.join(dest, entry.name)
+    if (entry.isDirectory()) await copyDirRecursive(srcChild, destChild)
+    else await fs.promises.copyFile(srcChild, destChild)
+  }
+}
+
+// Copy file OR directory (recursive)
+ipcMain.handle('fs:copy', async (_, src, dest) => {
+  try {
+    const stat = await fs.promises.stat(src)
+    if (stat.isDirectory()) await copyDirRecursive(src, dest)
+    else {
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true })
+      await fs.promises.copyFile(src, dest)
+    }
+    return { ok: true }
+  } catch (e) { return { ok: false, error: e.code, message: e.message } }
 })
 
 ipcMain.handle('fs:delete-file', async (_, filePath) => {
@@ -151,12 +187,14 @@ ipcMain.handle('fs:delete-item', async (_, itemPath) => {
 
 ipcMain.handle('fs:copy-file', async (_, src, dest) => {
   try {
-    await fs.promises.mkdir(path.dirname(dest), { recursive: true })
-    await fs.promises.copyFile(src, dest)
+    const stat = await fs.promises.stat(src)
+    if (stat.isDirectory()) await copyDirRecursive(src, dest)
+    else {
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true })
+      await fs.promises.copyFile(src, dest)
+    }
     return { ok: true }
-  } catch (e) {
-    return { ok: false, error: e.code, message: e.message }
-  }
+  } catch (e) { return { ok: false, error: e.code, message: e.message } }
 })
 
 ipcMain.handle('fs:exists', async (_, filePath) => {
@@ -174,8 +212,8 @@ ipcMain.handle('fs:reveal', async (_, itemPath) => {
 
 // ─── Settings Store ───────────────────────────────────────────────────────────
 let Store
-try { Store = require('electron-store') } catch { }
-const store = Store ? new Store() : { get: () => undefined, set: () => { }, store: {} }
+try { Store = require('electron-store') } catch {}
+const store = Store ? new Store() : { get: () => undefined, set: () => {}, store: {} }
 
 ipcMain.handle('store:get', (_, key) => store.get(key))
 ipcMain.handle('store:set', (_, key, value) => store.set(key, value))
@@ -225,7 +263,7 @@ ipcMain.handle('search:in-files', async (_, folder, query, opts = {}) => {
             const re = new RegExp(query, caseSensitive ? '' : 'i')
             const m = re.exec(line)
             if (m) matchStart = m.index
-          } catch { }
+          } catch {}
         } else {
           matchStart = caseSensitive ? line.indexOf(query) : line.toLowerCase().indexOf(query.toLowerCase())
         }
@@ -242,7 +280,7 @@ ipcMain.handle('search:in-files', async (_, folder, query, opts = {}) => {
 
 // ─── Terminal (node-pty) ──────────────────────────────────────────────────────
 let pty
-try { pty = require('node-pty') } catch { }
+try { pty = require('node-pty') } catch {}
 const terminals = new Map()
 
 ipcMain.handle('term:create', (event, id, cwd) => {

@@ -3,34 +3,62 @@ import {
   FolderOpen, FolderClosed, File, FileCode, FileText, ChevronRight, ChevronDown,
   FilePlus, FolderPlus, RefreshCw, ChevronsUpDown,
 } from 'lucide-react'
-import { useStore, OpenFile } from '../../stores/appStore'
+import { useStore } from '../../stores/appStore'
 import './FilesPanel.css'
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Cross-platform path utilities ────────────────────────────────────────────
+// On Windows, Electron returns paths with backslashes.
+// We normalise EVERYTHING to forward-slashes internally.
+
+function normPath(p: string): string {
+  return p.replace(/\\/g, '/')
+}
+
+function pathDirname(p: string): string {
+  const n = normPath(p)
+  const idx = n.lastIndexOf('/')
+  return idx >= 0 ? n.slice(0, idx) : n
+}
+
+function pathBasename(p: string): string {
+  const n = normPath(p)
+  return n.slice(n.lastIndexOf('/') + 1)
+}
+
+function pathJoin(a: string, b: string): string {
+  return normPath(a).replace(/\/+$/, '') + '/' + b
+}
+
+function pathStartsWith(child: string, parent: string): boolean {
+  const c = normPath(child)
+  const p = normPath(parent).replace(/\/+$/, '') + '/'
+  return c.startsWith(p) || c === normPath(parent)
+}
+
+// ─── Validation ───────────────────────────────────────────────────────────────
 const INVALID_CHARS = /[\\/:*?"<>|]/
 const MAX_NAME_LEN  = 255
 
-const EXT_LANG: Record<string, string> = {
-  '.ts': 'typescript', '.tsx': 'typescript', '.js': 'javascript', '.jsx': 'javascript',
-  '.py': 'python', '.rs': 'rust', '.html': 'html', '.css': 'css', '.json': 'json',
-  '.md': 'markdown', '.yml': 'yaml', '.yaml': 'yaml', '.sh': 'shell',
-  '.toml': 'toml', '.sql': 'sql', '.go': 'go', '.java': 'java',
-}
-
-function getLanguage(name: string): string {
-  const ext = '.' + (name.split('.').pop()?.toLowerCase() || '')
-  return EXT_LANG[ext] || 'plaintext'
-}
-
 function validateName(name: string): string | null {
-  if (!name.trim()) return 'Name cannot be empty'
+  if (!name.trim())              return 'Name cannot be empty'
   if (INVALID_CHARS.test(name)) return 'Name cannot contain: \\ / : * ? " < > |'
   if (name.length > MAX_NAME_LEN) return 'Name is too long'
   return null
 }
 
-function joinPath(a: string, b: string): string {
-  return a.replace(/[\\/]+$/, '') + '/' + b
+// ─── Name conflict resolution ─────────────────────────────────────────────────
+async function resolveNameConflict(destPath: string): Promise<string> {
+  if (!window.api) return destPath
+  if (!(await window.api.exists(destPath))) return destPath
+  const ext  = destPath.includes('.') ? destPath.slice(destPath.lastIndexOf('.')) : ''
+  const base = destPath.slice(0, destPath.length - ext.length)
+  let candidate = `${base} copy${ext}`
+  let n = 2
+  while (await window.api.exists(candidate)) {
+    candidate = `${base} copy ${n}${ext}`
+    n++
+  }
+  return candidate
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -40,6 +68,17 @@ function FileIcon({ name, isDir, expanded }: { name: string; isDir: boolean; exp
   if (['ts','tsx','js','jsx','py','rs','dart'].includes(ext)) return <FileCode size={14} className="fi-code" />
   if (['md','txt','csv'].includes(ext)) return <FileText size={14} className="fi-text" />
   return <File size={14} className="fi-file" />
+}
+
+function getLanguage(name: string): string {
+  const ext = '.' + (name.split('.').pop()?.toLowerCase() || '')
+  const map: Record<string, string> = {
+    '.ts':'typescript','.tsx':'typescript','.js':'javascript','.jsx':'javascript',
+    '.py':'python','.rs':'rust','.html':'html','.css':'css','.json':'json',
+    '.md':'markdown','.yml':'yaml','.yaml':'yaml','.sh':'shell',
+    '.toml':'toml','.sql':'sql','.go':'go','.java':'java',
+  }
+  return map[ext] || 'plaintext'
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -83,19 +122,16 @@ interface InlineInputProps {
 
 function InlineInput({ depth, isDir, initialValue = '', onConfirm, onCancel, existingNames = [] }: InlineInputProps) {
   const [value, setValue] = useState(initialValue)
-  const [error, setError]   = useState<string | null>(null)
-  const [busy, setBusy]     = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [busy,  setBusy]  = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useLayoutEffect(() => {
     inputRef.current?.focus()
     if (initialValue) {
       const dotIdx = initialValue.lastIndexOf('.')
-      if (dotIdx > 0 && !isDir) {
-        inputRef.current?.setSelectionRange(0, dotIdx)
-      } else {
-        inputRef.current?.select()
-      }
+      if (dotIdx > 0 && !isDir) inputRef.current?.setSelectionRange(0, dotIdx)
+      else inputRef.current?.select()
     }
   }, [])
 
@@ -105,11 +141,6 @@ function InlineInput({ depth, isDir, initialValue = '', onConfirm, onCancel, exi
     const finalName = v.endsWith('/') ? v.slice(0, -1) : v
     if (existingNames.includes(finalName)) return `⚠ '${finalName}' already exists in this location`
     return null
-  }
-
-  const handleChange = (v: string) => {
-    setValue(v)
-    setError(validate(v))
   }
 
   const handleConfirm = async () => {
@@ -122,7 +153,7 @@ function InlineInput({ depth, isDir, initialValue = '', onConfirm, onCancel, exi
 
   const handleKey = (e: React.KeyboardEvent) => {
     e.stopPropagation()
-    if (e.key === 'Enter') { e.preventDefault(); handleConfirm() }
+    if (e.key === 'Enter')  { e.preventDefault(); handleConfirm() }
     if (e.key === 'Escape') { e.preventDefault(); onCancel() }
   }
 
@@ -135,11 +166,10 @@ function InlineInput({ depth, isDir, initialValue = '', onConfirm, onCancel, exi
           className={`tree-rename-input ${error ? 'input-err' : ''}`}
           value={value}
           disabled={busy}
-          onChange={e => handleChange(e.target.value)}
+          onChange={e => { setValue(e.target.value); setError(validate(e.target.value)) }}
           onKeyDown={handleKey}
           onBlur={onCancel}
           placeholder={isDir ? 'folder name' : 'file name'}
-          style={{ flex: 1 }}
         />
         {error && <div className="inline-error">{error}</div>}
       </div>
@@ -152,6 +182,7 @@ interface CtxItem { label: string; icon?: string; shortcut?: string; danger?: bo
 
 function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: CtxItem[]; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ left: x, top: y })
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -161,28 +192,18 @@ function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: Ct
     return () => document.removeEventListener('mousedown', handler)
   }, [onClose])
 
-  // Clamp position so it doesn't go off screen
-  const [pos, setPos] = useState({ left: x, top: y })
   useLayoutEffect(() => {
     if (!ref.current) return
     const { width, height } = ref.current.getBoundingClientRect()
-    setPos({
-      left: Math.min(x, window.innerWidth  - width  - 8),
-      top:  Math.min(y, window.innerHeight - height - 8),
-    })
+    setPos({ left: Math.min(x, window.innerWidth - width - 8), top: Math.min(y, window.innerHeight - height - 8) })
   }, [x, y])
 
   return (
     <div ref={ref} className="ctx-menu-v2" style={{ left: pos.left, top: pos.top }} onMouseDown={e => e.stopPropagation()}>
       {items.map((item, i) =>
-        item.separator ? (
-          <div key={i} className="ctx-sep" />
-        ) : (
-          <div
-            key={i}
-            className={`ctx-item-v2 ${item.danger ? 'danger' : ''}`}
-            onMouseDown={(e) => { e.preventDefault(); item.action?.(); onClose() }}
-          >
+        item.separator ? <div key={i} className="ctx-sep" /> : (
+          <div key={i} className={`ctx-item-v2 ${item.danger ? 'danger' : ''}`}
+            onMouseDown={e => { e.preventDefault(); item.action?.(); onClose() }}>
             <span className="ctx-icon">{item.icon}</span>
             <span className="ctx-label">{item.label}</span>
             {item.shortcut && <span className="ctx-shortcut">{item.shortcut}</span>}
@@ -191,6 +212,24 @@ function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: Ct
       )}
     </div>
   )
+}
+
+// ─── Clipboard state (module-level so it persists across re-renders) ──────────
+interface Clipboard { paths: string[]; mode: 'copy' | 'cut' }
+let _clipboard: Clipboard | null = null
+const _clipListeners: Set<() => void> = new Set()
+function setClipboard(c: Clipboard | null) {
+  _clipboard = c
+  _clipListeners.forEach(fn => fn())
+}
+function useClipboard() {
+  const [, forceUpdate] = useState(0)
+  useEffect(() => {
+    const fn = () => forceUpdate(n => n + 1)
+    _clipListeners.add(fn)
+    return () => { _clipListeners.delete(fn) }
+  }, [])
+  return _clipboard
 }
 
 // ─── Tree Node ────────────────────────────────────────────────────────────────
@@ -205,8 +244,6 @@ interface TreeItemProps {
   onOpen: (n: TreeNode) => void
   onRefresh: () => void
   onStartCreate: (parentPath: string, isDir: boolean, depth: number) => void
-  clipboard: { path: string; mode: 'copy' | 'cut' } | null
-  setClipboard: (c: { path: string; mode: 'copy' | 'cut' } | null) => void
   workspaceRoot: string
   creatingIn: CreatingIn
   setCreatingIn: (c: CreatingIn) => void
@@ -214,23 +251,29 @@ interface TreeItemProps {
 
 function TreeItem({
   node, depth, selectedPath, onSelect, onOpen, onRefresh,
-  onStartCreate, clipboard, setClipboard, workspaceRoot,
-  creatingIn, setCreatingIn,
+  onStartCreate, workspaceRoot, creatingIn, setCreatingIn,
 }: TreeItemProps) {
   const [expanded,  setExpanded]  = useState(depth === 0)
   const [children,  setChildren]  = useState<TreeNode[]>([])
   const [renaming,  setRenaming]  = useState(false)
   const [ctx,       setCtx]       = useState<{ x: number; y: number } | null>(null)
-  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [dragOver,  setDragOver]  = useState(false)
+  const [dragging,  setDragging]  = useState(false)
 
-  const { gitFiles, openFiles, activeFileIndex, renameOpenFile, closeFile } = useStore()
-  const gitStatus   = gitFiles.find(g => g.path === node.path || node.path.endsWith(g.path))
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const clipboard  = useClipboard()
+
+  const { gitFiles, openFiles, activeFileIndex, renameOpenFile, closeFile, addTerminalTab } = useStore()
+
+  const gitStatus    = gitFiles.find(g => node.path.endsWith(g.path) || normPath(node.path) === normPath(g.path))
   const isActiveFile = !node.isDir && openFiles[activeFileIndex]?.path === node.path
   const isSelected   = selectedPath === node.path
+  const isCut        = clipboard?.mode === 'cut' && clipboard.paths.includes(node.path)
+
   const gitColor = gitStatus
     ? gitStatus.status === 'M' ? 'var(--git-modified)'
     : gitStatus.status === 'A' ? 'var(--git-added)'
-    : gitStatus.status === 'D' ? 'var(--git-deleted)' : undefined
+    : 'var(--git-deleted)'
     : undefined
 
   const loadChildren = useCallback(async () => {
@@ -241,19 +284,13 @@ function TreeItem({
         if (a.isDir !== b.isDir) return b.isDir ? 1 : -1
         return a.name.localeCompare(b.name)
       })
-      setChildren(sorted.map((e: any) => ({ name: e.name, path: e.path, isDir: e.isDir })))
+      setChildren(sorted.map((e: any) => ({ name: e.name, path: normPath(e.path), isDir: e.isDir })))
     }
   }, [node.path, node.isDir])
 
-  useEffect(() => {
-    if (expanded && node.isDir) loadChildren()
-  }, [expanded])
+  useEffect(() => { if (expanded && node.isDir) loadChildren() }, [expanded])
 
-  // Refresh children when anything changes inside this folder
-  const handleChildRefresh = useCallback(async () => {
-    await loadChildren()
-    onRefresh()
-  }, [loadChildren, onRefresh])
+  const handleChildRefresh = useCallback(async () => { await loadChildren(); onRefresh() }, [loadChildren, onRefresh])
 
   const toggle = async () => {
     if (!node.isDir) { onOpen(node); return }
@@ -261,94 +298,154 @@ function TreeItem({
     setExpanded(e => !e)
   }
 
-  // Slow double-click to rename (like VS Code)
+  // Slow double-click rename
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation()
     onSelect(node.path)
     if (clickTimer.current) {
-      clearTimeout(clickTimer.current)
-      clickTimer.current = null
-      setRenaming(true)
-      return
+      clearTimeout(clickTimer.current); clickTimer.current = null
+      setRenaming(true); return
     }
-    clickTimer.current = setTimeout(() => {
-      clickTimer.current = null
-      toggle()
-    }, 300)
+    clickTimer.current = setTimeout(() => { clickTimer.current = null; toggle() }, 300)
   }
 
   const handleCtxMenu = (e: React.MouseEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    onSelect(node.path)
-    setCtx({ x: e.clientX, y: e.clientY })
+    e.preventDefault(); e.stopPropagation()
+    onSelect(node.path); setCtx({ x: e.clientX, y: e.clientY })
   }
 
-  // ── Rename ────────────────────────────────────────────────────────────────
+  // ── Rename (Bug 1 fix: cross-platform path construction) ──────────────────
   const handleRenameConfirm = async (newName: string) => {
     const finalName = newName.endsWith('/') ? newName.slice(0, -1) : newName
     if (!finalName || finalName === node.name) { setRenaming(false); return }
-    const parentDir = node.path.substring(0, node.path.lastIndexOf('/'))
-    const newPath = joinPath(parentDir, finalName)
+
+    // Use cross-platform pathDirname/pathJoin — NEVER lastIndexOf('/')
+    const parentDir = pathDirname(node.path)
+    const newPath   = pathJoin(parentDir, finalName)
+
     const res = await window.api.rename(node.path, newPath)
     if (res.ok) {
       renameOpenFile(node.path, newPath, finalName)
       showToast(`✅ Renamed: ${node.name} → ${finalName}`)
-      setRenaming(false)
-      onRefresh()
+      setRenaming(false); onRefresh()
     } else {
       showToast(`❌ ${res.message || res.error}`, 'err')
+      setRenaming(false)
     }
   }
 
   // ── Delete ────────────────────────────────────────────────────────────────
   const handleDelete = async () => {
-    if (!confirm(`Are you sure you want to delete '${node.name}'?\nThis cannot be undone.`)) return
-    // Close any open editor tab for this path
-    const tabIdx = openFiles.findIndex(f => f.path === node.path || f.path.startsWith(node.path + '/'))
+    if (!confirm(`Delete '${node.name}'?\nThis cannot be undone.`)) return
+    const tabIdx = openFiles.findIndex(f => normPath(f.path) === normPath(node.path) || normPath(f.path).startsWith(normPath(node.path) + '/'))
     if (tabIdx >= 0) closeFile(tabIdx)
     const res = await window.api.deleteItem(node.path)
-    if (res.ok) {
-      showToast(`🗑️ Deleted: ${node.name}`)
-      onRefresh()
-    } else {
-      showToast(`❌ ${res.message || res.error}`, 'err')
-    }
+    if (res.ok) { showToast(`🗑️ Deleted: ${node.name}`); onRefresh() }
+    else showToast(`❌ ${res.message || res.error}`, 'err')
   }
 
-  // ── Copy / Cut / Paste ────────────────────────────────────────────────────
-  const handleCopy = () => setClipboard({ path: node.path, mode: 'copy' })
-  const handleCut  = () => setClipboard({ path: node.path, mode: 'cut'  })
+  // ── Copy / Cut / Paste (Bug 2 fix) ───────────────────────────────────────
+  const handleCopy = () => setClipboard({ paths: [node.path], mode: 'copy' })
+  const handleCut  = () => setClipboard({ paths: [node.path], mode: 'cut'  })
 
   const handlePaste = async () => {
     if (!clipboard || !node.isDir) return
-    const srcName = clipboard.path.split('/').pop() || 'file'
-    const destPath = joinPath(node.path, srcName)
-    if (clipboard.mode === 'copy') {
-      const res = await window.api.copyFile(clipboard.path, destPath)
-      if (res.ok) { showToast(`✅ Copied: ${srcName}`); loadChildren(); onRefresh() }
-      else showToast(`❌ ${res.message || res.error}`, 'err')
-    } else {
-      const res = await window.api.rename(clipboard.path, destPath)
-      if (res.ok) { setClipboard(null); showToast(`✅ Moved: ${srcName}`); onRefresh() }
-      else showToast(`❌ ${res.message || res.error}`, 'err')
+    const targetDir = node.path
+
+    for (const srcPath of clipboard.paths) {
+      const srcName = pathBasename(srcPath)
+      let destPath = await resolveNameConflict(pathJoin(targetDir, srcName))
+
+      if (clipboard.mode === 'copy') {
+        const res = await window.api.copy(srcPath, destPath)
+        if (res.ok) showToast(`✅ Copied: ${srcName}`)
+        else { showToast(`❌ Copy failed: ${res.message || res.error}`, 'err'); continue }
+      } else {
+        const res = await window.api.rename(srcPath, destPath)
+        if (res.ok) {
+          renameOpenFile(srcPath, destPath, pathBasename(destPath))
+          showToast(`✅ Moved: ${srcName}`)
+        } else { showToast(`❌ Move failed: ${res.message || res.error}`, 'err'); continue }
+      }
     }
+
+    if (clipboard.mode === 'cut') setClipboard(null)  // paste once for cut
+    await loadChildren()
+    setExpanded(true)
+    onRefresh()
   }
 
-  // ── Copy path ─────────────────────────────────────────────────────────────
   const copyAbsPath = () => navigator.clipboard.writeText(node.path)
   const copyRelPath = () => {
-    const rel = node.path.startsWith(workspaceRoot)
-      ? node.path.slice(workspaceRoot.length).replace(/^[\\/]/, '')
+    const rel = normPath(node.path).startsWith(normPath(workspaceRoot))
+      ? normPath(node.path).slice(normPath(workspaceRoot).length).replace(/^\//, '')
       : node.path
     navigator.clipboard.writeText(rel)
   }
 
-  // ── Open in terminal ──────────────────────────────────────────────────────
-  const { addTerminalTab } = useStore()
   const openInTerminal = () => {
-    const targetDir = node.isDir ? node.path : node.path.substring(0, node.path.lastIndexOf('/'))
-    addTerminalTab(targetDir)
+    const dir = node.isDir ? node.path : pathDirname(node.path)
+    addTerminalTab(dir)
+  }
+
+  // ── Drag and Drop (Bug 3 fix) ─────────────────────────────────────────────
+  const handleDragStart = (e: React.DragEvent) => {
+    e.stopPropagation()
+    e.dataTransfer.setData('text/plain', node.path)
+    e.dataTransfer.effectAllowed = 'move'
+    setDragging(true)
+  }
+
+  const handleDragEnd = () => setDragging(false)
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!node.isDir) { e.preventDefault(); return }
+    e.preventDefault()
+    e.stopPropagation()
+    e.dataTransfer.dropEffect = 'move'
+    setDragOver(true)
+  }
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    if (!node.isDir) return
+    e.preventDefault(); e.stopPropagation()
+    setDragOver(true)
+  }
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.stopPropagation()
+    setDragOver(false)
+  }
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault(); e.stopPropagation()
+    setDragOver(false)
+    const srcPath = e.dataTransfer.getData('text/plain')
+    if (!srcPath) return
+
+    const targetDir = node.isDir ? node.path : pathDirname(node.path)
+
+    // Prevent drop onto itself or own subfolder
+    if (pathStartsWith(targetDir, srcPath)) {
+      showToast('❌ Cannot move a folder into itself', 'err'); return
+    }
+    // Prevent drop into same location
+    if (normPath(pathDirname(srcPath)) === normPath(targetDir)) return
+
+    const srcName = pathBasename(srcPath)
+    const rawDest = pathJoin(targetDir, srcName)
+    const destPath = await resolveNameConflict(rawDest)
+
+    const res = await window.api.rename(srcPath, destPath)
+    if (res.ok) {
+      renameOpenFile(srcPath, destPath, pathBasename(destPath))
+      showToast(`✅ Moved: ${srcName} → ${pathBasename(targetDir)}/`)
+      if (!expanded) { await loadChildren(); setExpanded(true) }
+      else await loadChildren()
+      onRefresh()
+    } else {
+      showToast(`❌ Move failed: ${res.message || res.error}`, 'err')
+    }
   }
 
   // ── Context menu items ────────────────────────────────────────────────────
@@ -360,53 +457,61 @@ function TreeItem({
     { icon: '✂️',  label: 'Cut',  action: handleCut  },
     { icon: '📌', label: 'Paste', action: handlePaste },
     { separator: true },
-    { icon: '✏️',  label: 'Rename', shortcut: 'F2', action: () => setRenaming(true) },
+    { icon: '✏️',  label: 'Rename', shortcut: 'F2',  action: () => setRenaming(true) },
     { icon: '🗑️', label: 'Delete', shortcut: 'Del', danger: true, action: handleDelete },
     { separator: true },
-    { icon: '📂', label: 'Open in Terminal',  action: openInTerminal  },
+    { icon: '📂', label: 'Open in Terminal',   action: openInTerminal },
     { icon: '📁', label: 'Reveal in Explorer', action: () => window.api.revealInExplorer(node.path) },
   ] : [
     { icon: '📋', label: 'Copy', action: handleCopy },
     { icon: '✂️',  label: 'Cut',  action: handleCut  },
     { separator: true },
-    { icon: '✏️',  label: 'Rename', shortcut: 'F2', action: () => setRenaming(true) },
+    { icon: '✏️',  label: 'Rename', shortcut: 'F2',  action: () => setRenaming(true) },
     { icon: '🗑️', label: 'Delete', shortcut: 'Del', danger: true, action: handleDelete },
     { separator: true },
     { icon: '📋', label: 'Copy Path',          action: copyAbsPath },
-    { icon: '📋', label: 'Copy Relative Path', action: copyRelPath  },
+    { icon: '📋', label: 'Copy Relative Path', action: copyRelPath },
     { icon: '📂', label: 'Open Containing Folder in Terminal', action: openInTerminal },
     { icon: '📁', label: 'Reveal in Explorer', action: () => window.api.revealInExplorer(node.path) },
   ]
 
-  // Sibling names for duplicate-name check in inline creation
   const siblingNames = children.map(c => c.name)
 
-  // ── Keyboard handling when this row is selected ───────────────────────────
   const handleRowKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'F2') { e.preventDefault(); setRenaming(true) }
+    if (e.key === 'F2')     { e.preventDefault(); setRenaming(true) }
     if (e.key === 'Delete') { e.preventDefault(); handleDelete() }
   }
 
   return (
     <div>
-      {/* Tree row */}
+      {/* Row */}
       {renaming ? (
         <InlineInput
-          depth={depth}
-          isDir={node.isDir}
-          initialValue={node.name}
-          onConfirm={handleRenameConfirm}
-          onCancel={() => setRenaming(false)}
+          depth={depth} isDir={node.isDir} initialValue={node.name}
+          onConfirm={handleRenameConfirm} onCancel={() => setRenaming(false)}
           existingNames={[]}
         />
       ) : (
         <div
-          className={`tree-item ${isActiveFile || isSelected ? 'active' : ''}`}
+          className={[
+            'tree-item',
+            (isActiveFile || isSelected) ? 'active' : '',
+            dragOver  ? 'drag-over'  : '',
+            dragging  ? 'dragging'   : '',
+            isCut     ? 'cut-item'   : '',
+          ].join(' ').trim()}
           style={{ paddingLeft: depth * 12 + 8 }}
           onClick={handleClick}
           onContextMenu={handleCtxMenu}
           onKeyDown={handleRowKey}
           tabIndex={0}
+          draggable
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          onDragOver={handleDragOver}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
           data-path={node.path}
         >
           {node.isDir
@@ -419,18 +524,15 @@ function TreeItem({
         </div>
       )}
 
-      {/* Inline creation slot inside this folder */}
+      {/* Inline creation inside folder */}
       {node.isDir && expanded && creatingIn?.parentPath === node.path && (
         <InlineInput
-          depth={creatingIn.depth}
-          isDir={creatingIn.isDir}
+          depth={creatingIn.depth} isDir={creatingIn.isDir}
           onConfirm={async (name) => {
-            const isFolder = creatingIn.isDir || name.endsWith('/')
+            const isFolder  = creatingIn.isDir || name.endsWith('/')
             const finalName = name.endsWith('/') ? name.slice(0, -1) : name
-            const fullPath = joinPath(node.path, finalName)
-            const res = isFolder
-              ? await window.api.createDir(fullPath)
-              : await window.api.createFile(fullPath)
+            const fullPath  = pathJoin(node.path, finalName)
+            const res       = isFolder ? await window.api.createDir(fullPath) : await window.api.createFile(fullPath)
             if (res.ok) {
               showToast(`✅ Created: ${finalName}`)
               setCreatingIn(null)
@@ -445,9 +547,7 @@ function TreeItem({
                 })
               }
               onRefresh()
-            } else {
-              showToast(`❌ ${res.message || res.error}`, 'err')
-            }
+            } else showToast(`❌ ${res.message || res.error}`, 'err')
           }}
           onCancel={() => setCreatingIn(null)}
           existingNames={siblingNames}
@@ -457,30 +557,16 @@ function TreeItem({
       {/* Children */}
       {node.isDir && expanded && children.map(child => (
         <TreeItem
-          key={child.path}
-          node={child}
-          depth={depth + 1}
-          selectedPath={selectedPath}
-          onSelect={onSelect}
-          onOpen={onOpen}
-          onRefresh={handleChildRefresh}
+          key={child.path} node={child} depth={depth + 1}
+          selectedPath={selectedPath} onSelect={onSelect}
+          onOpen={onOpen} onRefresh={handleChildRefresh}
           onStartCreate={onStartCreate}
-          clipboard={clipboard}
-          setClipboard={setClipboard}
           workspaceRoot={workspaceRoot}
-          creatingIn={creatingIn}
-          setCreatingIn={setCreatingIn}
+          creatingIn={creatingIn} setCreatingIn={setCreatingIn}
         />
       ))}
 
-      {/* Context menu portal */}
-      {ctx && (
-        <ContextMenu
-          x={ctx.x} y={ctx.y}
-          items={ctxItems}
-          onClose={() => setCtx(null)}
-        />
-      )}
+      {ctx && <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems} onClose={() => setCtx(null)} />}
     </div>
   )
 }
@@ -492,7 +578,6 @@ export default function FilesPanel() {
   const [refreshKey,   setRefreshKey]   = useState(0)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [creatingIn,   setCreatingIn]   = useState<CreatingIn>(null)
-  const [clipboard,    setClipboard]    = useState<{ path: string; mode: 'copy' | 'cut' } | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
 
   const loadRoot = useCallback(async () => {
@@ -503,7 +588,7 @@ export default function FilesPanel() {
         if (a.isDir !== b.isDir) return b.isDir ? 1 : -1
         return a.name.localeCompare(b.name)
       })
-      setRootChildren(sorted.map((e: any) => ({ name: e.name, path: e.path, isDir: e.isDir })))
+      setRootChildren(sorted.map((e: any) => ({ name: e.name, path: normPath(e.path), isDir: e.isDir })))
     }
     loadGitStatus()
   }, [folderPath])
@@ -522,15 +607,12 @@ export default function FilesPanel() {
     }
   }
 
-  // Determine context folder for toolbar New File / New Folder
   const getCreateContext = (): { parentPath: string; depth: number } => {
     if (!folderPath) return { parentPath: '', depth: 0 }
-    if (!selectedPath) return { parentPath: folderPath, depth: 0 }
-    // If selected is a dir, create inside it; if a file, create in its parent
-    const isSelectedDir = rootChildren.some(c => c.path === selectedPath && c.isDir)
-    if (isSelectedDir) return { parentPath: selectedPath, depth: 1 }
-    const parentPath = selectedPath.substring(0, selectedPath.lastIndexOf('/'))
-    return { parentPath: parentPath || folderPath, depth: 1 }
+    if (!selectedPath) return { parentPath: normPath(folderPath), depth: 0 }
+    const isDir = rootChildren.some(c => normPath(c.path) === normPath(selectedPath) && c.isDir)
+    if (isDir) return { parentPath: normPath(selectedPath), depth: 1 }
+    return { parentPath: pathDirname(normPath(selectedPath)) || normPath(folderPath), depth: 1 }
   }
 
   const startCreate = (isDir: boolean) => {
@@ -538,17 +620,19 @@ export default function FilesPanel() {
     if (parentPath) setCreatingIn({ parentPath, isDir, depth })
   }
 
-  // Root-level inline creation slot
   const rootSiblingNames = rootChildren.map(c => c.name)
 
-  // Panel keyboard shortcuts
+  // Global Ctrl+C/X/V keyboard shortcuts at panel level
   const handlePanelKey = (e: React.KeyboardEvent) => {
+    const ctrl = e.ctrlKey || e.metaKey
     if (!selectedPath) return
+    if (ctrl && e.key === 'c' && !e.shiftKey) { e.preventDefault(); setClipboard({ paths: [selectedPath], mode: 'copy' }) }
+    if (ctrl && e.key === 'x') { e.preventDefault(); setClipboard({ paths: [selectedPath], mode: 'cut'  }) }
     if (e.altKey && !e.shiftKey && e.key === 'n') { e.preventDefault(); startCreate(false) }
     if (e.altKey &&  e.shiftKey && e.key === 'N') { e.preventDefault(); startCreate(true) }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'c') { if (selectedPath) setClipboard({ path: selectedPath, mode: 'copy' }) }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'x') { if (selectedPath) setClipboard({ path: selectedPath, mode: 'cut'  }) }
   }
+
+  const normRoot = folderPath ? normPath(folderPath) : ''
 
   return (
     <div className="files-panel" ref={panelRef} tabIndex={-1} onKeyDown={handlePanelKey}>
@@ -558,7 +642,7 @@ export default function FilesPanel() {
           <button className="icon-btn" onClick={() => startCreate(false)} title="New File (Alt+N)"><FilePlus size={14} /></button>
           <button className="icon-btn" onClick={() => startCreate(true)}  title="New Folder (Alt+Shift+N)"><FolderPlus size={14} /></button>
           <button className="icon-btn" onClick={() => setRefreshKey(k => k + 1)} title="Refresh"><RefreshCw size={14} /></button>
-          <button className="icon-btn" title="Collapse All" onClick={() => setRefreshKey(k => k + 1)}><ChevronsUpDown size={14} /></button>
+          <button className="icon-btn" onClick={() => setRefreshKey(k => k + 1)} title="Collapse All"><ChevronsUpDown size={14} /></button>
         </div>
       </div>
 
@@ -572,25 +656,21 @@ export default function FilesPanel() {
         ) : (
           <div className="tree-root">
             <div className="tree-folder-name">
-              {folderPath.split('/').pop() || folderPath.split('\\').pop()}
+              {normPath(folderPath).split('/').pop() || folderPath}
             </div>
 
             {/* Root-level inline creation */}
-            {creatingIn && creatingIn.parentPath === folderPath && (
+            {creatingIn && creatingIn.parentPath === normRoot && (
               <InlineInput
-                depth={0}
-                isDir={creatingIn.isDir}
+                depth={0} isDir={creatingIn.isDir}
                 onConfirm={async (name) => {
-                  const isFolder = creatingIn.isDir || name.endsWith('/')
+                  const isFolder  = creatingIn.isDir || name.endsWith('/')
                   const finalName = name.endsWith('/') ? name.slice(0, -1) : name
-                  const fullPath = joinPath(folderPath, finalName)
-                  const res = isFolder
-                    ? await window.api.createDir(fullPath)
-                    : await window.api.createFile(fullPath)
+                  const fullPath  = pathJoin(normRoot, finalName)
+                  const res       = isFolder ? await window.api.createDir(fullPath) : await window.api.createFile(fullPath)
                   if (res.ok) {
                     showToast(`✅ Created: ${finalName}`)
-                    setCreatingIn(null)
-                    setRefreshKey(k => k + 1)
+                    setCreatingIn(null); setRefreshKey(k => k + 1)
                     if (!isFolder) {
                       const content = await window.api.readFile(fullPath)
                       openFile({
@@ -600,9 +680,7 @@ export default function FilesPanel() {
                         isDirty: false, cursorLine: 1, cursorCol: 1, scrollTop: 0,
                       })
                     }
-                  } else {
-                    showToast(`❌ ${res.message || res.error}`, 'err')
-                  }
+                  } else showToast(`❌ ${res.message || res.error}`, 'err')
                 }}
                 onCancel={() => setCreatingIn(null)}
                 existingNames={rootSiblingNames}
@@ -611,19 +689,12 @@ export default function FilesPanel() {
 
             {rootChildren.map(node => (
               <TreeItem
-                key={node.path}
-                node={node}
-                depth={0}
-                selectedPath={selectedPath}
-                onSelect={setSelectedPath}
-                onOpen={handleFileOpen}
-                onRefresh={() => setRefreshKey(k => k + 1)}
-                onStartCreate={(parentPath, isDir, depth) => setCreatingIn({ parentPath, isDir, depth })}
-                clipboard={clipboard}
-                setClipboard={setClipboard}
-                workspaceRoot={folderPath}
-                creatingIn={creatingIn}
-                setCreatingIn={setCreatingIn}
+                key={node.path} node={node} depth={0}
+                selectedPath={selectedPath} onSelect={setSelectedPath}
+                onOpen={handleFileOpen} onRefresh={() => setRefreshKey(k => k + 1)}
+                onStartCreate={(p, d, dep) => setCreatingIn({ parentPath: p, isDir: d, depth: dep })}
+                workspaceRoot={normRoot}
+                creatingIn={creatingIn} setCreatingIn={setCreatingIn}
               />
             ))}
           </div>

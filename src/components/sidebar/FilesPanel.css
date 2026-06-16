@@ -82,3 +82,40 @@
 .toast-ok  { background: var(--bg-panel); border: 1px solid var(--git-added);   color: var(--git-added); }
 .toast-err { background: var(--bg-panel); border: 1px solid var(--git-deleted); color: var(--git-deleted); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ── Drag and Drop ─────────────────────────────────────────────────────────── */
+.tree-item.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.tree-item.drag-over {
+  background: var(--accent-soft, rgba(0,120,212,0.15)) !important;
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  border-radius: 3px;
+}
+
+.tree-item[draggable="true"] {
+  cursor: grab;
+}
+
+/* ── Cut items (50% opacity until pasted) ──────────────────────────────────── */
+.tree-item.cut-item {
+  opacity: 0.5;
+}
+
+/* ── Drag ghost (native ghost is fine, this is a fallback) ─────────────────── */
+.drag-ghost {
+  position: fixed;
+  top: -9999px;
+  left: -9999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  pointer-events: none;
+  white-space: nowrap;
+}

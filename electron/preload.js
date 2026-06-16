@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('api', {
   rename:      (o, n)    => ipcRenderer.invoke('fs:rename', o, n),
   deleteItem:  (p)       => ipcRenderer.invoke('fs:delete-item', p),
   copyFile:    (s, d)    => ipcRenderer.invoke('fs:copy-file', s, d),
+  copy:        (s, d)    => ipcRenderer.invoke('fs:copy', s, d),
   exists:      (p)       => ipcRenderer.invoke('fs:exists', p),
   revealInExplorer: (p)  => ipcRenderer.invoke('fs:reveal', p),
 

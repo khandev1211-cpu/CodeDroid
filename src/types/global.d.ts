@@ -19,7 +19,8 @@ declare global {
       rename: (oldPath: string, newPath: string) => Promise<{ ok: boolean; error?: string; message?: string }>
       deleteItem: (path: string) => Promise<{ ok: boolean; error?: string; message?: string }>
       copyFile: (src: string, dest: string) => Promise<{ ok: boolean; error?: string; message?: string }>
-      exists: (path: string) => Promise<boolean>
+      copy:     (src: string, dest: string) => Promise<{ ok: boolean; error?: string; message?: string }>
+      exists:   (path: string) => Promise<boolean>
       revealInExplorer: (path: string) => Promise<void>
 
       // Settings store
