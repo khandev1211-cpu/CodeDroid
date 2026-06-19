@@ -58,6 +58,10 @@ export interface AiMessage {
   appliedSkills?: string[]
   agentSteps?: AgentStep[]
   planSteps?: PlanStep[]
+  thinking?: string          // collapsible reasoning block
+  isThinkingStreaming?: boolean
+  isTruncated?: boolean      // hit token limit
+  continuationOf?: string    // id of parent truncated message
 }
 
 export interface GitFileStatus {

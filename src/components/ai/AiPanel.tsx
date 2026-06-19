@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react"
 import {
   Bot, Send, Trash2, Copy, Loader2, Zap, CheckCheck,
   ChevronDown, RefreshCw, Sparkles, Map, History,
-  Play, Pause, Square, ChevronRight, Wrench
+  Play, Pause, Square, ChevronRight, Wrench, Brain,
 } from "lucide-react"
 import { useStore, AiProvider, AiMessage, PlanStep, AgentStep } from "../../stores/appStore"
 import { useHistoryStore } from "../../stores/historyStore"
@@ -11,6 +11,8 @@ import { Skill } from "../../skills/skillRegistry"
 import ChatModeSelector from "./ChatModeSelector"
 import PromptEnhancer from "./PromptEnhancer"
 import HistoryPanel from "./HistoryPanel"
+import ThinkingBlock from "./ThinkingBlock"
+import TokenLimitPopup from "./TokenLimitPopup"
 import "./AiPanel.css"
 
 // ── Provider config ─────────────────────────────────────────────────────────
@@ -120,7 +122,36 @@ function MessageBubble({ msg, onExecutePlan }: { msg: AiMessage; onExecutePlan?:
           ? <div className="msg-text">{msg.content}</div>
           : (
             <>
+              {/* Thinking block — shown above the answer */}
+              {msg.thinking && (
+                <ThinkingBlock
+                  thinking={msg.thinking}
+                  isStreaming={msg.isThinkingStreaming}
+                />
+              )}
+
               <div className="msg-md" dangerouslySetInnerHTML={{__html: renderMarkdown(displayedContent)}} />
+
+              {/* Token limit popup — shown when response was cut off */}
+              {msg.isTruncated && !msg.isStreaming && (
+                <TokenLimitPopup
+                  truncatedContent={msg.content}
+                  onContinue={() => {
+                    // Fire a custom event that the send function handles
+                    window.dispatchEvent(new CustomEvent('codedroid-continue-response', {
+                      detail: { messageId: msg.id, content: msg.content }
+                    }))
+                  }}
+                  onStop={() => {
+                    // Clear truncation flag
+                    useStore.setState(s => ({
+                      aiMessages: s.aiMessages.map(m =>
+                        m.id === msg.id ? { ...m, isTruncated: false } : m
+                      )
+                    }))
+                  }}
+                />
+              )}
 
               {/* Plan Steps - Interactive Cards */}
               {msg.planSteps && msg.planSteps.length > 0 && (
@@ -460,6 +491,7 @@ export default function AiPanel() {
   const [showHistory, setShowHistory] = useState(false)
   const [isErrorMode, setIsErrorMode] = useState(false)
   const [errorBannerDismissed, setErrorBannerDismissed] = useState(false)
+  const [useDeepThink, setUseDeepThink] = useState(false)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
@@ -470,6 +502,36 @@ export default function AiPanel() {
   useEffect(() => {
     setDetectedSkills(detectSkills(input))
   }, [input])
+
+  // Auto-activate deep think when input looks complex
+  useEffect(() => {
+    if (input.length > 80) {
+      const lower = input.toLowerCase()
+      const complexKeywords = ['architect','refactor','optimize','debug','why','explain','design','algorithm','performance','security','compare']
+      const matches = complexKeywords.filter(k => lower.includes(k)).length
+      if (matches >= 2) setUseDeepThink(true)
+    }
+  }, [input])
+
+  // Listen for continue-response event from TokenLimitPopup
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const { messageId, content } = (e as CustomEvent).detail
+      // Find the original message to get context
+      const msg = useStore.getState().aiMessages.find(m => m.id === messageId)
+      if (!msg) return
+      // Clear truncation flag
+      useStore.setState(s => ({
+        aiMessages: s.aiMessages.map(m =>
+          m.id === messageId ? { ...m, isTruncated: false } : m
+        )
+      }))
+      // Send continuation prompt
+      await sendAiMessage(`Please continue from where you stopped. Do not repeat anything. Continue seamlessly:\n\n${content.slice(-300)}`)
+    }
+    window.addEventListener('codedroid-continue-response', handler)
+    return () => window.removeEventListener('codedroid-continue-response', handler)
+  }, [])
 
   // Paste detection — check if pasted text looks like an error report
   const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -504,6 +566,7 @@ export default function AiPanel() {
 
     // Open / reuse agent terminal tab
     addAgentTerminal(workspace)
+    useStore.getState().setAgentRunning(true)
 
     setAiLoading(true)
     const assistantId = addAiMessage({
@@ -566,23 +629,26 @@ export default function AiPanel() {
           } else if (data.type === 'success') {
             updateAiMessage(assistantId, fullText, false)
             setAiLoading(false)
+            useStore.getState().setAgentRunning(false)
             ws.close()
             resolve()
           } else if (data.type === 'failed') {
             updateAiMessage(assistantId, fullText, false)
             setAiLoading(false)
+            useStore.getState().setAgentRunning(false)
             ws.close()
             resolve()
           } else if (data.type === 'done') {
             updateAiMessage(assistantId, fullText, false)
             setAiLoading(false)
+            useStore.getState().setAgentRunning(false)
             ws.close()
             resolve()
           }
         }
 
-        ws.onerror = () => { setAiLoading(false); ws.close(); resolve() }
-      } catch { setAiLoading(false); resolve() }
+        ws.onerror = () => { setAiLoading(false); useStore.getState().setAgentRunning(false); ws.close(); resolve() }
+      } catch { setAiLoading(false); useStore.getState().setAgentRunning(false); resolve() }
     })
   }
 
@@ -594,6 +660,12 @@ export default function AiPanel() {
     const skills = detectSkills(text)
 
     setInput(""); setShowCommands(false)
+
+    // Agent mode: mark agent as running and ensure the dedicated terminal exists
+    if (mode === 'agent') {
+      useStore.getState().setAgentRunning(true)
+      useStore.getState().addAgentTerminal(folderPath || undefined)
+    }
 
     // Skill Injection logic
     const baseSystemPrompt = `You are CodeDroid AI Copilot, an expert coding assistant embedded in an IDE.
@@ -689,7 +761,8 @@ Important rules for Agent mode:
               provider, api_key: key, model, host: settings.ollamaHost,
               system: systemInjected,
               mode,
-              skills: skills.map(s => s.id)
+              skills: skills.map(s => s.id),
+              thinking: useDeepThink,
             }))
           }
 
@@ -702,6 +775,43 @@ Important rules for Agent mode:
             if (data.type === 'token') {
               fullText += data.text
               updateAiMessage(assistantId, fullText, true)
+            } else if (data.type === 'thinking_start') {
+              // Mark message as actively thinking
+              useStore.setState(s => ({
+                aiMessages: s.aiMessages.map(m =>
+                  m.id === assistantId ? { ...m, isThinkingStreaming: true } : m)
+              }))
+            } else if (data.type === 'thinking') {
+              // Append thinking content and turn off spinner
+              useStore.setState(s => ({
+                aiMessages: s.aiMessages.map(m =>
+                  m.id === assistantId
+                    ? { ...m, thinking: (m.thinking || '') + data.text, isThinkingStreaming: false }
+                    : m)
+              }))
+            } else if (data.type === 'truncated') {
+              // Response hit token limit — show continue popup (except in agent mode)
+              if (mode !== 'agent') {
+                useStore.setState(s => ({
+                  aiMessages: s.aiMessages.map(m =>
+                    m.id === assistantId ? { ...m, isTruncated: true } : m)
+                }))
+              } else {
+                // Agent mode: auto-continue silently
+                fullText += '\n\n⟳ *Continuing response…*\n\n'
+                updateAiMessage(assistantId, fullText, true)
+              }
+            } else if (data.type === 'terminal_output') {
+              // Stream agent command output into the dedicated agent terminal tab
+              window.dispatchEvent(new CustomEvent('codedroid-agent-terminal-write', {
+                detail: { line: data.line, isError: !!data.is_error }
+              }))
+            } else if (data.type === 'agent_warning') {
+              // Show a step card warning (e.g. hanging process)
+              agentSteps.push({ id: Math.random().toString(), tool: 'warning', input: data.message, status: 'error' })
+              useStore.setState((s) => ({
+                aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, agentSteps: [...agentSteps] } : m)
+              }))
             } else if (data.type === 'tool_start') {
               agentSteps.push({ id: Math.random().toString(), tool: data.tool, input: JSON.stringify(data.args), status: 'running' })
               useStore.setState((s) => ({
@@ -1022,6 +1132,10 @@ Important rules for Agent mode:
       console.warn("[AiPanel] Sidecar unreachable — using direct API (no tool execution)")
       await runDirect()
     }
+
+    if (mode === 'agent') {
+      useStore.getState().setAgentRunning(false)
+    }
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -1140,6 +1254,14 @@ Important rules for Agent mode:
 
           <div className="input-actions">
             <PromptEnhancer input={input} setInput={setInput} />
+            <button
+              className={`deep-think-btn ${useDeepThink ? 'active' : ''}`}
+              title={useDeepThink ? 'Deep Think ON — click to disable' : 'Enable Deep Think (extended reasoning)'}
+              onClick={() => setUseDeepThink(t => !t)}
+            >
+              <Brain size={13} />
+              {useDeepThink && <span className="deep-think-label">Deep Think</span>}
+            </button>
             <button className="ai-send-btn" onClick={send} disabled={!input.trim() || aiLoading}>
               {aiLoading ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
             </button>

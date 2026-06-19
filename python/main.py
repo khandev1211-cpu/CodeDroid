@@ -28,6 +28,21 @@ except ImportError:
     def is_error_paste(text: str) -> bool:
         return False
 
+try:
+    from thinking_detector import (
+        should_use_thinking, is_native_thinking_model,
+        extract_think_tags, inject_cot_into_system,
+        was_response_truncated, has_incomplete_code_block, merge_continuations,
+    )
+except ImportError:
+    def should_use_thinking(p, m): return False
+    def is_native_thinking_model(m): return False
+    def extract_think_tags(r): return "", r
+    def inject_cot_into_system(s): return s
+    def was_response_truncated(r, p): return False
+    def has_incomplete_code_block(t): return False
+    def merge_continuations(a, b): return a + "\n" + b
+
 app = FastAPI(title="CodeDroid AI Sidecar", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -64,6 +79,7 @@ class ChatRequest(BaseModel):
     system: str = ""
     mode: str = "ask"
     skills: list[str] = []
+    thinking: bool = False      # manually force thinking mode
 
 class ToolRequest(BaseModel):
     tool: str
@@ -241,8 +257,102 @@ TOOLS = [
     },
 ]
 
+# ─── Agent terminal streaming with hanging detection ──────────────────────────
+async def run_command_streaming(command: str, workspace: str, ws=None) -> dict:
+    """
+    Run a command, streaming stdout/stderr line-by-line to the websocket in
+    real time, and warn if the process produces no output for 30+ seconds.
+    """
+    cwd = workspace or _workspace_root or None
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    last_output_time = asyncio.get_event_loop().time()
+    warning_sent = False
+    done = asyncio.Event()
+
+    async def check_hanging():
+        nonlocal warning_sent
+        while not done.is_set():
+            await asyncio.sleep(5)
+            if done.is_set():
+                break
+            elapsed = asyncio.get_event_loop().time() - last_output_time
+            if elapsed > 30 and not warning_sent and ws is not None:
+                try:
+                    await ws.send_text(json.dumps({
+                        "type": "agent_warning",
+                        "message": "⚠️ Process has produced no output for 30 seconds — it may be hanging or waiting for input"
+                    }))
+                except Exception:
+                    pass
+                warning_sent = True
+
+    async def stream_stdout():
+        nonlocal last_output_time
+        if proc.stdout is None:
+            return
+        async for line in proc.stdout:
+            decoded = line.decode(errors="replace")
+            stdout_lines.append(decoded)
+            last_output_time = asyncio.get_event_loop().time()
+            if ws is not None:
+                try:
+                    await ws.send_text(json.dumps({
+                        "type": "terminal_output", "stream": "stdout", "line": decoded
+                    }))
+                except Exception:
+                    pass
+
+    async def stream_stderr():
+        nonlocal last_output_time
+        if proc.stderr is None:
+            return
+        async for line in proc.stderr:
+            decoded = line.decode(errors="replace")
+            stderr_lines.append(decoded)
+            last_output_time = asyncio.get_event_loop().time()
+            if ws is not None:
+                try:
+                    await ws.send_text(json.dumps({
+                        "type": "terminal_output", "stream": "stderr", "line": decoded, "is_error": True
+                    }))
+                except Exception:
+                    pass
+
+    hang_task = asyncio.create_task(check_hanging())
+    try:
+        await asyncio.gather(stream_stdout(), stream_stderr())
+        await proc.wait()
+    finally:
+        done.set()
+        hang_task.cancel()
+        try:
+            await hang_task
+        except asyncio.CancelledError:
+            pass
+
+    full_stdout = "".join(stdout_lines)
+    full_stderr = "".join(stderr_lines)
+    had_error = (proc.returncode != 0) or bool(full_stderr.strip())
+
+    return {
+        "stdout": full_stdout[:3000],
+        "stderr": full_stderr[:3000],
+        "exit_code": proc.returncode,
+        "had_error": had_error,
+        "output": (full_stdout + full_stderr)[:4000],
+    }
+
+
 # ─── Tool executor ─────────────────────────────────────────────────────────────
-async def execute_tool(tool_name: str, args: dict) -> str:
+async def execute_tool(tool_name: str, args: dict, ws=None) -> str:
     try:
         if tool_name == "read_file":
             p = Path(_resolve_path(args["path"]))
@@ -276,6 +386,12 @@ async def execute_tool(tool_name: str, args: dict) -> str:
 
         elif tool_name == "run_command":
             cwd = _resolve_path(args.get("cwd", "")) or _workspace_root or None
+            # Use streaming + hanging-detection version when a websocket is available
+            # (i.e. when called from the agent loop, not the one-shot /tool REST endpoint)
+            if ws is not None:
+                result = await run_command_streaming(args["command"], cwd or "", ws)
+                return json.dumps(result)
+
             proc = await asyncio.create_subprocess_shell(
                 args["command"],
                 stdout=asyncio.subprocess.PIPE,
@@ -581,10 +697,7 @@ async def websocket_chat(ws: WebSocket):
                     if req.provider == "groq":
                         # ── Groq: native function-calling agent loop ─────────────────────
                         groq_history = trim_messages_for_groq(req.messages)
-                        current_messages = [{"role": "system", "content": system}] + groq_history
-                        max_iterations = 8 if req.mode == "agent" else 1
                         groq_model = req.model or "llama-3.3-70b-versatile"
-                        # compound-* are system agents, not direct /chat/completions models
                         if groq_model.startswith("compound"):
                             await ws.send_text(json.dumps({
                                 "type": "token",
@@ -593,6 +706,20 @@ async def websocket_chat(ws: WebSocket):
                             await ws.send_text(json.dumps({"type": "done"}))
                             return
                         groq_max_tokens = GROQ_MAX_TOKENS.get(groq_model, GROQ_MAX_TOKENS["default"])
+
+                        # ── Thinking mode ──────────────────────────────────────────────────
+                        use_thinking = req.thinking or should_use_thinking(req.messages[-1].get("content","") if req.messages else "", req.mode)
+                        native_think = is_native_thinking_model(groq_model)
+
+                        groq_system = system
+                        if use_thinking and not native_think:
+                            groq_system = inject_cot_into_system(system)
+
+                        if use_thinking:
+                            await ws.send_text(json.dumps({"type": "thinking_start"}))
+
+                        current_messages = [{"role": "system", "content": groq_system}] + groq_history
+                        max_iterations = 8 if req.mode == "agent" else 1
 
                         for i in range(max_iterations):
                             payload: dict = {
@@ -607,6 +734,7 @@ async def websocket_chat(ws: WebSocket):
 
                             tool_calls: list = []
                             full_content = ""
+                            finish_reason = ""
                             async with client.stream(
                                 "POST", "https://api.groq.com/openai/v1/chat/completions",
                                 headers={"Authorization": f"Bearer {req.api_key}"},
@@ -616,7 +744,9 @@ async def websocket_chat(ws: WebSocket):
                                     if line.startswith("data: ") and line != "data: [DONE]":
                                         try:
                                             chunk = json.loads(line[6:])
-                                            delta = chunk["choices"][0]["delta"]
+                                            choice = chunk["choices"][0]
+                                            delta = choice["delta"]
+                                            finish_reason = choice.get("finish_reason") or finish_reason
                                             if "content" in delta and delta["content"]:
                                                 full_content += delta["content"]
                                                 await ws.send_text(json.dumps({"type": "token", "text": delta["content"]}))
@@ -630,6 +760,16 @@ async def websocket_chat(ws: WebSocket):
                                                         if "arguments" in tc["function"]: tool_calls[tc["index"]]["function"]["arguments"] += tc["function"]["arguments"]
                                         except: pass
 
+                            # Extract thinking block for native models
+                            if use_thinking and native_think and full_content:
+                                thinking, full_content = extract_think_tags(full_content)
+                                if thinking:
+                                    await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
+
+                            # Truncation detection
+                            if was_response_truncated(finish_reason, "groq") and req.mode != "agent":
+                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
+
                             if not tool_calls:
                                 break
 
@@ -641,7 +781,7 @@ async def websocket_chat(ws: WebSocket):
                                 except Exception:
                                     args = {}
                                 await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                result = await execute_tool(name, args)
+                                result = await execute_tool(name, args, ws)
                                 await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
                                 current_messages.append({
                                     "role": "tool", "tool_call_id": tc["id"],
@@ -693,7 +833,7 @@ async def websocket_chat(ws: WebSocket):
                                         args = block.get("input", {})
                                         tool_id = block.get("id", "")
                                         await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                        result = await execute_tool(name, args)
+                                        result = await execute_tool(name, args, ws)
                                         await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
                                         tool_results.append({"type": "tool_result", "tool_use_id": tool_id, "content": result})
 
@@ -702,20 +842,56 @@ async def websocket_chat(ws: WebSocket):
                                 if i == max_iterations - 1:
                                     await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
                         else:
-                            async with client.stream(
-                                "POST", "https://api.anthropic.com/v1/messages",
-                                headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                                json={"model": claude_model, "max_tokens": 4096, "stream": True, "system": system, "messages": req.messages},
-                            ) as resp:
-                                async for line in resp.aiter_lines():
-                                    if line.startswith("data: "):
-                                        try:
-                                            chunk = json.loads(line[6:])
-                                            if chunk.get("type") == "content_block_delta":
-                                                token = chunk["delta"].get("text", "")
-                                                if token:
-                                                    await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                        except: pass
+                            # ── Claude Ask/Plan — streaming with thinking support ─────────
+                            use_thinking = req.thinking or should_use_thinking(
+                                req.messages[-1].get("content","") if req.messages else "", req.mode)
+
+                            claude_payload: dict = {
+                                "model": claude_model, "max_tokens": 4096, "stream": True,
+                                "system": system, "messages": req.messages,
+                            }
+
+                            # Claude native extended thinking
+                            if use_thinking and "claude" in claude_model:
+                                claude_payload["thinking"] = {"type": "enabled", "budget_tokens": 5000}
+                                claude_payload["max_tokens"] = 8000  # thinking needs headroom
+                                claude_payload["stream"] = False    # streaming + thinking not yet stable
+                                await ws.send_text(json.dumps({"type": "thinking_start"}))
+                                r = await client.post(
+                                    "https://api.anthropic.com/v1/messages",
+                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01",
+                                             "content-type": "application/json",
+                                             "anthropic-beta": "interleaved-thinking-2025-05-14"},
+                                    json=claude_payload,
+                                )
+                                resp_data = r.json()
+                                for block in resp_data.get("content", []):
+                                    if block.get("type") == "thinking":
+                                        await ws.send_text(json.dumps({"type": "thinking", "text": block.get("thinking", "")}))
+                                    elif block.get("type") == "text":
+                                        await ws.send_text(json.dumps({"type": "token", "text": block.get("text", "")}))
+                                if was_response_truncated(resp_data.get("stop_reason",""), "claude"):
+                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": resp_data.get("stop_reason","")}))
+                            else:
+                                finish_reason = ""
+                                async with client.stream(
+                                    "POST", "https://api.anthropic.com/v1/messages",
+                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                    json=claude_payload,
+                                ) as resp:
+                                    async for line in resp.aiter_lines():
+                                        if line.startswith("data: "):
+                                            try:
+                                                chunk = json.loads(line[6:])
+                                                if chunk.get("type") == "content_block_delta":
+                                                    token = chunk["delta"].get("text", "")
+                                                    if token:
+                                                        await ws.send_text(json.dumps({"type": "token", "text": token}))
+                                                elif chunk.get("type") == "message_delta":
+                                                    finish_reason = chunk.get("delta", {}).get("stop_reason", "")
+                                            except: pass
+                                if was_response_truncated(finish_reason, "claude"):
+                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
 
                     elif req.provider == "ollama":
                         # ── Ollama: prompt-injection agent loop ──────────────────────────
@@ -743,7 +919,7 @@ async def websocket_chat(ws: WebSocket):
                                             if name:
                                                 tool_called = True
                                                 await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                                result = await execute_tool(name, args)
+                                                result = await execute_tool(name, args, ws)
                                                 await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
                                                 current_messages.append({"role": "user", "content": f"[TOOL RESULT for {name}]\n{result}"})
                                         except: pass
@@ -753,19 +929,36 @@ async def websocket_chat(ws: WebSocket):
                                 if i == max_iterations - 1:
                                     await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
                         else:
+                            # ── Ollama Ask/Plan — streaming with thinking support ─────────
+                            use_thinking = req.thinking or should_use_thinking(
+                                req.messages[-1].get("content","") if req.messages else "", req.mode)
+                            native_think_ol = is_native_thinking_model(ollama_model)
+                            ollama_system = system
+                            if use_thinking and not native_think_ol:
+                                ollama_system = inject_cot_into_system(system)
+                            if use_thinking:
+                                await ws.send_text(json.dumps({"type": "thinking_start"}))
                             async with client.stream(
                                 "POST", f"{req.host}/api/chat",
                                 json={"model": ollama_model, "stream": True,
-                                      "messages": [{"role": "system", "content": system}] + req.messages},
+                                      "messages": [{"role": "system", "content": ollama_system}] + req.messages},
                             ) as resp:
+                                full_ol = ""
                                 async for line in resp.aiter_lines():
                                     if line.strip():
                                         try:
                                             chunk = json.loads(line)
                                             token = chunk.get("message", {}).get("content", "")
                                             if token:
+                                                full_ol += token
                                                 await ws.send_text(json.dumps({"type": "token", "text": token}))
+                                            if chunk.get("done") and was_response_truncated(chunk.get("done_reason",""), "ollama"):
+                                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": chunk.get("done_reason","")}))
                                         except: pass
+                            if use_thinking and native_think_ol:
+                                thinking, _ = extract_think_tags(full_ol)
+                                if thinking:
+                                    await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
 
                     else:  # gemini
                         # ── Gemini: prompt-injection agent loop ──────────────────────────
@@ -797,7 +990,7 @@ async def websocket_chat(ws: WebSocket):
                                             if name:
                                                 tool_called = True
                                                 await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                                result = await execute_tool(name, args)
+                                                result = await execute_tool(name, args, ws)
                                                 await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
                                                 gemini_messages.append({"role": "user", "parts": [{"text": f"[TOOL RESULT for {name}]\n{result}"}]})
                                         except: pass
@@ -807,15 +1000,48 @@ async def websocket_chat(ws: WebSocket):
                                 if i == max_iterations - 1:
                                     await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
                         else:
+                            # ── Gemini Ask/Plan with thinking support ─────────────────────
+                            use_thinking_gem = req.thinking or should_use_thinking(
+                                req.messages[-1].get("content","") if req.messages else "", req.mode)
+                            native_think_gem = is_native_thinking_model(gemini_model)
+
+                            gem_json: dict = {
+                                "system_instruction": {"parts": [{"text": system}]},
+                                "contents": req.messages,
+                            }
+                            # Gemini 2.0 flash-thinking / 2.5 support thinking budget
+                            if use_thinking_gem and native_think_gem:
+                                gem_json["generationConfig"] = {"thinkingConfig": {"thinkingBudget": 8192}}
+                                await ws.send_text(json.dumps({"type": "thinking_start"}))
+                            elif use_thinking_gem:
+                                gem_json["system_instruction"]["parts"][0]["text"] = inject_cot_into_system(system)
+                                await ws.send_text(json.dumps({"type": "thinking_start"}))
+
                             r = await client.post(
                                 f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
                                 params={"key": req.api_key},
-                                json={"system_instruction": {"parts": [{"text": system}]}, "contents": req.messages},
+                                json=gem_json,
                             )
                             data = r.json()
-                            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                            if text:
-                                await ws.send_text(json.dumps({"type": "token", "text": text}))
+                            candidate = data.get("candidates", [{}])[0]
+                            finish = candidate.get("finishReason", "")
+                            for part in candidate.get("content", {}).get("parts", []):
+                                part_text = part.get("text", "")
+                                if not part_text:
+                                    continue
+                                if part.get("thought"):
+                                    await ws.send_text(json.dumps({"type": "thinking", "text": part_text}))
+                                else:
+                                    if use_thinking_gem and not native_think_gem:
+                                        # CoT: extract <thinking> tags from plain text
+                                        thinking, answer = extract_think_tags(part_text)
+                                        if thinking:
+                                            await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
+                                        await ws.send_text(json.dumps({"type": "token", "text": answer}))
+                                    else:
+                                        await ws.send_text(json.dumps({"type": "token", "text": part_text}))
+                            if was_response_truncated(finish, "gemini"):
+                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish}))
 
                 await ws.send_text(json.dumps({"type": "done"}))
 

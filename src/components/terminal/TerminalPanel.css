@@ -28,3 +28,66 @@
 /* xterm overrides */
 .xterm-viewport::-webkit-scrollbar { width: 6px; }
 .xterm-viewport::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+
+/* ── Floating Fix Error button ───────────────────────────────────────────────── */
+.term-fix-btn {
+  position: absolute;
+  top: 8px; right: 10px;
+  z-index: 100;
+  background: #f59e0b;
+  color: #000;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  animation: slideInRight 0.18s ease;
+  transition: background 0.1s;
+}
+.term-fix-btn:hover { background: #fbbf24; }
+@keyframes slideInRight { from { opacity:0; transform: translateX(12px); } to { opacity:1; transform: none; } }
+
+/* ── Terminal right-click context menu ──────────────────────────────────────── */
+.term-ctx-menu {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 6px);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  min-width: 200px;
+  padding: 4px 0;
+  user-select: none;
+}
+.term-ctx-item {
+  padding: 6px 14px;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: background 0.05s;
+}
+.term-ctx-item:hover { background: var(--bg-hover); color: var(--text); }
+.term-ctx-ai { color: var(--accent); }
+.term-ctx-ai:hover { background: var(--accent-soft, rgba(0,120,212,0.1)); color: var(--accent); }
+.term-ctx-sep { height: 1px; background: var(--border-light); margin: 3px 0; }
+
+/* ── Agent Running indicator ─────────────────────────────────────────────────── */
+.term-tab.agent-running {
+  animation: agentPulse 1.6s ease-in-out infinite;
+}
+@keyframes agentPulse {
+  0%, 100% { border-top-color: #f59e0b; }
+  50%      { border-top-color: #fbbf24; }
+}
+.agent-running-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #f59e0b;
+  margin-right: 4px;
+  animation: agentDotPulse 1s ease-in-out infinite;
+}
+@keyframes agentDotPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.7); }
+}

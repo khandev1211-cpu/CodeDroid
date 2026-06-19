@@ -1,0 +1,44 @@
+.token-limit-popup {
+  margin: 8px 0;
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--git-modified);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: fadeIn 0.15s ease;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+.tlp-icon  { font-size: 20px; }
+.tlp-title { font-weight: 700; font-size: 13px; color: var(--text); }
+.tlp-body  { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+
+.tlp-preview {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 6px 8px;
+  border-left: 3px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tlp-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tlp-btn { font-size: 12px; padding: 5px 14px; }
+
+.tlp-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  border-top: 1px solid var(--border-light);
+  padding-top: 8px;
+  line-height: 1.4;
+}

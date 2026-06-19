@@ -933,3 +933,20 @@
 .step-status-icon.running  { background: var(--accent);       color: #fff; }
 .step-status-icon.success  { background: var(--git-added);    color: #fff; }
 .step-status-icon.error    { background: var(--git-deleted);  color: #fff; }
+
+/* ── Deep Think badge button ─────────────────────────────────────────────────── */
+.deep-think-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: none; border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 8px;
+  font-size: 11px; color: var(--text-dim);
+  cursor: pointer; transition: all 0.1s;
+  flex-shrink: 0;
+}
+.deep-think-btn:hover { border-color: var(--accent); color: var(--accent); }
+.deep-think-btn.active {
+  background: rgba(139,92,246,0.12);
+  border-color: #8b5cf6;
+  color: #8b5cf6;
+}
+.deep-think-label { font-weight: 600; font-size: 10px; }
