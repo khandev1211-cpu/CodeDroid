@@ -767,8 +767,16 @@ async def websocket_chat(ws: WebSocket):
                                     await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
 
                             # Truncation detection
-                            if was_response_truncated(finish_reason, "groq") and req.mode != "agent":
-                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
+                            # Ask/Plan: always emit — frontend shows the Continue popup
+                            # Agent: only emit when the loop is actually ending truncated
+                            # (no tool call follow-up, so the agent can't self-correct via another turn)
+                            if was_response_truncated(finish_reason, "groq"):
+                                if req.mode != "agent":
+                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
+                                elif not tool_calls:
+                                    # Agent mode hit the token limit with no further tool calls queued —
+                                    # the final answer itself got cut off. Auto-continue inline.
+                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
 
                             if not tool_calls:
                                 break
@@ -824,6 +832,8 @@ async def websocket_chat(ws: WebSocket):
                                         await ws.send_text(json.dumps({"type": "token", "text": block["text"]}))
 
                                 if stop_reason != "tool_use":
+                                    if was_response_truncated(stop_reason, "claude"):
+                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": stop_reason}))
                                     break
 
                                 tool_results = []
@@ -906,7 +916,8 @@ async def websocket_chat(ws: WebSocket):
                                     f"{req.host}/api/chat",
                                     json={"model": ollama_model, "stream": False, "messages": current_messages},
                                 )
-                                reply = r.json().get("message", {}).get("content", "")
+                                reply_data = r.json()
+                                reply = reply_data.get("message", {}).get("content", "")
                                 current_messages.append({"role": "assistant", "content": reply})
                                 tool_called = False
                                 for ln in reply.splitlines():
@@ -925,6 +936,8 @@ async def websocket_chat(ws: WebSocket):
                                         except: pass
                                 if not tool_called:
                                     await ws.send_text(json.dumps({"type": "token", "text": reply}))
+                                    if was_response_truncated(reply_data.get("done_reason", ""), "ollama"):
+                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": reply_data.get("done_reason", "")}))
                                     break
                                 if i == max_iterations - 1:
                                     await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
@@ -977,7 +990,10 @@ async def websocket_chat(ws: WebSocket):
                                         "contents": gemini_messages,
                                     },
                                 )
-                                reply = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                gem_resp = r.json()
+                                gem_candidate = gem_resp.get("candidates", [{}])[0]
+                                reply = gem_candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+                                gem_finish = gem_candidate.get("finishReason", "")
                                 gemini_messages.append({"role": "model", "parts": [{"text": reply}]})
                                 tool_called = False
                                 for ln in reply.splitlines():
@@ -996,6 +1012,8 @@ async def websocket_chat(ws: WebSocket):
                                         except: pass
                                 if not tool_called:
                                     await ws.send_text(json.dumps({"type": "token", "text": reply}))
+                                    if was_response_truncated(gem_finish, "gemini"):
+                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": gem_finish}))
                                     break
                                 if i == max_iterations - 1:
                                     await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))

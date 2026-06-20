@@ -137,13 +137,11 @@ function MessageBubble({ msg, onExecutePlan }: { msg: AiMessage; onExecutePlan?:
                 <TokenLimitPopup
                   truncatedContent={msg.content}
                   onContinue={() => {
-                    // Fire a custom event that the send function handles
                     window.dispatchEvent(new CustomEvent('codedroid-continue-response', {
-                      detail: { messageId: msg.id, content: msg.content }
+                      detail: { messageId: msg.id }
                     }))
                   }}
                   onStop={() => {
-                    // Clear truncation flag
                     useStore.setState(s => ({
                       aiMessages: s.aiMessages.map(m =>
                         m.id === msg.id ? { ...m, isTruncated: false } : m
@@ -495,6 +493,8 @@ export default function AiPanel() {
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
+  const sendRef   = useRef<(overrideText?: string, isContinuation?: boolean) => void>(() => {})
+  const continuationHopsRef = useRef<Map<string, number>>(new Map())
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [aiMessages, aiLoading])
 
@@ -514,20 +514,13 @@ export default function AiPanel() {
   }, [input])
 
   // Listen for continue-response event from TokenLimitPopup
+  // (sendRef keeps this listener pointed at the latest send() closure)
   useEffect(() => {
-    const handler = async (e: Event) => {
-      const { messageId, content } = (e as CustomEvent).detail
-      // Find the original message to get context
+    const handler = (e: Event) => {
+      const { messageId } = (e as CustomEvent).detail
       const msg = useStore.getState().aiMessages.find(m => m.id === messageId)
       if (!msg) return
-      // Clear truncation flag
-      useStore.setState(s => ({
-        aiMessages: s.aiMessages.map(m =>
-          m.id === messageId ? { ...m, isTruncated: false } : m
-        )
-      }))
-      // Send continuation prompt
-      await sendAiMessage(`Please continue from where you stopped. Do not repeat anything. Continue seamlessly:\n\n${content.slice(-300)}`)
+      sendRef.current('', true)
     }
     window.addEventListener('codedroid-continue-response', handler)
     return () => window.removeEventListener('codedroid-continue-response', handler)
@@ -652,14 +645,14 @@ export default function AiPanel() {
     })
   }
 
-  const send = async () => {
-    const text = input.trim()
+  const send = async (overrideText?: string, isContinuation?: boolean) => {
+    const text = (overrideText ?? input).trim()
     if (!text || aiLoading) return
 
     const mode = settings.activeMode || 'ask'
-    const skills = detectSkills(text)
+    const skills = isContinuation ? [] : detectSkills(text)
 
-    setInput(""); setShowCommands(false)
+    if (!overrideText) { setInput(""); setShowCommands(false) }
 
     // Agent mode: mark agent as running and ensure the dedicated terminal exists
     if (mode === 'agent') {
@@ -692,14 +685,36 @@ Important rules for Agent mode:
     }
 
     const provider = settings.activeProvider
-    addAiMessage({ role: 'user', content: text, provider, mode, appliedSkills: skills.map(s => s.name) })
+
+    let assistantId: string
+    let continuingMessageOriginalContent = ''
+
+    if (isContinuation) {
+      // Don't add a new user bubble — find the truncated assistant message and resume it
+      const truncatedMsg = [...aiMessages].reverse().find(m => m.role === 'assistant' && m.isTruncated)
+      if (truncatedMsg) {
+        assistantId = truncatedMsg.id
+        continuingMessageOriginalContent = truncatedMsg.content
+        useStore.setState(s => ({
+          aiMessages: s.aiMessages.map(m =>
+            m.id === assistantId ? { ...m, isTruncated: false, isStreaming: true } : m)
+        }))
+      } else {
+        assistantId = addAiMessage({
+          role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: [],
+          agentSteps: [], planSteps: [],
+        })
+      }
+    } else {
+      addAiMessage({ role: 'user', content: text, provider, mode, appliedSkills: skills.map(s => s.name) })
+      assistantId = addAiMessage({
+        role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: skills.map(s => s.name),
+        agentSteps: [], planSteps: [],
+      })
+    }
+
     setAiLoading(true)
     useStore.setState({ aiResponseStartTime: Date.now(), aiLastResponseTime: null })
-
-    const assistantId = addAiMessage({
-      role: 'assistant', content: '', provider, isStreaming: true, mode, appliedSkills: skills.map(s => s.name),
-      agentSteps: [], planSteps: [],
-    })
 
     // ── Token budget for Groq free tier (8000 TPM total = input + output) ──
     // Rough estimate: 1 token ≈ 4 chars
@@ -720,13 +735,29 @@ Important rules for Agent mode:
     }
 
     // Only send last N messages, each capped at MAX_HISTORY_CHARS
-    const trimmedHistory = aiMessages
-      .filter(m => m.content && m.role !== 'tool')
+    // For continuations, include the truncated assistant content as real context (not capped)
+    // so the model actually knows what it already wrote.
+    const baseHistory = aiMessages
+      .filter(m => m.content && m.role !== 'tool' && m.id !== assistantId)
       .slice(-MAX_HISTORY_MSGS)
       .map(m => ({
         role: m.role === 'assistant' ? 'assistant' : 'user',
         content: m.content.slice(0, MAX_HISTORY_CHARS),
       }))
+
+    const trimmedHistory = isContinuation
+      ? [
+          ...baseHistory,
+          { role: 'assistant', content: continuingMessageOriginalContent },
+          { role: 'user', content: 'Continue exactly where you left off. Do not repeat anything you already wrote. Do not add any preamble — just continue the content seamlessly from the last word.' },
+        ]
+      : baseHistory
+
+    // For continuations the "final user turn" is already the last item in trimmedHistory.
+    // For normal sends, we still need to append the new user message.
+    const finalMessages = isContinuation
+      ? trimmedHistory
+      : [...trimmedHistory, { role: 'user', content: text }]
 
     const trySidecar = (): Promise<boolean> => {
       return new Promise((resolve) => {
@@ -741,8 +772,9 @@ Important rules for Agent mode:
 
         try {
           const ws = new WebSocket('ws://127.0.0.1:8765/ws/chat')
-          let fullText = ''
+          let fullText = isContinuation ? continuingMessageOriginalContent : ''
           let agentSteps: AgentStep[] = []
+          let wasTruncatedThisTurn = false
 
           // Timeout if sidecar doesn't respond or connect within 1500ms
           const timeout = setTimeout(() => {
@@ -757,7 +789,7 @@ Important rules for Agent mode:
             const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
 
             ws.send(JSON.stringify({
-              messages: [...trimmedHistory, { role: 'user', content: text }],
+              messages: finalMessages,
               provider, api_key: key, model, host: settings.ollamaHost,
               system: systemInjected,
               mode,
@@ -790,16 +822,15 @@ Important rules for Agent mode:
                     : m)
               }))
             } else if (data.type === 'truncated') {
-              // Response hit token limit — show continue popup (except in agent mode)
-              if (mode !== 'agent') {
-                useStore.setState(s => ({
-                  aiMessages: s.aiMessages.map(m =>
-                    m.id === assistantId ? { ...m, isTruncated: true } : m)
-                }))
-              } else {
-                // Agent mode: auto-continue silently
-                fullText += '\n\n⟳ *Continuing response…*\n\n'
-                updateAiMessage(assistantId, fullText, true)
+              // Response hit token limit. Always record it on the message —
+              // Ask/Plan mode shows the Continue popup; Agent mode auto-continues
+              // once the 'done' event confirms this turn has fully finished streaming.
+              useStore.setState(s => ({
+                aiMessages: s.aiMessages.map(m =>
+                  m.id === assistantId ? { ...m, isTruncated: true } : m)
+              }))
+              if (mode === 'agent') {
+                wasTruncatedThisTurn = true
               }
             } else if (data.type === 'terminal_output') {
               // Stream agent command output into the dedicated agent terminal tab
@@ -863,6 +894,21 @@ Important rules for Agent mode:
               })
 
               ws.close()
+
+              // Agent mode auto-continuation: if this turn ended truncated,
+              // immediately resume in the same message (max 3 hops to avoid loops)
+              if (mode === 'agent' && wasTruncatedThisTurn) {
+                const hops = continuationHopsRef.current.get(assistantId) || 0
+                if (hops < 3) {
+                  continuationHopsRef.current.set(assistantId, hops + 1)
+                  setTimeout(() => sendRef.current('', true), 50)
+                } else {
+                  useStore.setState(s => ({
+                    aiMessages: s.aiMessages.map(m =>
+                      m.id === assistantId ? { ...m, isTruncated: false } : m)
+                  }))
+                }
+              }
             }
           }
 
@@ -885,7 +931,7 @@ Important rules for Agent mode:
 
     const runDirect = async () => {
       try {
-        let fullText = ''
+        let fullText = isContinuation ? continuingMessageOriginalContent : ''
         const key = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
         const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
 
@@ -920,7 +966,7 @@ Important rules for Agent mode:
             headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
               model: groqModel, stream: true, max_tokens: maxTokens,
-              messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+              messages: [{ role: 'system', content: systemInjected }, ...finalMessages]
             })
           })
 
@@ -931,6 +977,7 @@ Important rules for Agent mode:
 
           const reader = res.body!.getReader()
           const dec = new TextDecoder()
+          let groqFinishReason = ''
           while (true) {
             const { done, value } = await reader.read(); if (done) break
             const chunk = dec.decode(value)
@@ -939,8 +986,21 @@ Important rules for Agent mode:
                 try {
                   const d = JSON.parse(line.slice(6))
                   fullText += d.choices?.[0]?.delta?.content || ''
+                  groqFinishReason = d.choices?.[0]?.finish_reason || groqFinishReason
                   updateAiMessage(assistantId, fullText, true)
                 } catch {}
+              }
+            }
+          }
+          if (groqFinishReason === 'length') {
+            useStore.setState(s => ({
+              aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, isTruncated: true } : m)
+            }))
+            if (mode === 'agent') {
+              const hops = continuationHopsRef.current.get(assistantId) || 0
+              if (hops < 3) {
+                continuationHopsRef.current.set(assistantId, hops + 1)
+                setTimeout(() => sendRef.current('', true), 50)
               }
             }
           }
@@ -950,7 +1010,7 @@ Important rules for Agent mode:
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               system_instruction: { parts: [{ text: systemInjected }] },
-              contents: [...history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })), { role: 'user', parts: [{ text: text }] }]
+              contents: finalMessages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }))
             })
           })
 
@@ -976,7 +1036,7 @@ Important rules for Agent mode:
               max_tokens: 4096,
               stream: true,
               system: systemInjected,
-              messages: history.concat([{ role: 'user', content: text }])
+              messages: finalMessages
             })
           })
 
@@ -1019,7 +1079,7 @@ Important rules for Agent mode:
               window.api.ollamaChat(settings.ollamaHost, {
                 model: model,
                 stream: true,
-                messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+                messages: [{ role: 'system', content: systemInjected }, ...finalMessages]
               }).then(res => {
                 if (!res.ok) reject(new Error(res.error))
               })
@@ -1030,7 +1090,7 @@ Important rules for Agent mode:
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 model: model, stream: true,
-                messages: [{ role: 'system', content: systemInjected }, ...history, { role: 'user', content: text }]
+                messages: [{ role: 'system', content: systemInjected }, ...finalMessages]
               })
             })
 
@@ -1137,6 +1197,9 @@ Important rules for Agent mode:
       useStore.getState().setAgentRunning(false)
     }
   }
+
+  // Keep sendRef pointed at the latest send() closure (settings/aiMessages change every render)
+  useEffect(() => { sendRef.current = send })
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send() }
