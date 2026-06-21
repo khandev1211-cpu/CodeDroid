@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 import {
   Bot, Send, Trash2, Copy, Loader2, Zap, CheckCheck,
-  ChevronDown, RefreshCw, Sparkles, Map, History,
+  ChevronDown, RefreshCw, Sparkles, Map as MapIcon, History,
   Play, Pause, Square, ChevronRight, Wrench, Brain,
 } from "lucide-react"
 import { useStore, AiProvider, AiMessage, PlanStep, AgentStep } from "../../stores/appStore"
@@ -646,13 +646,22 @@ export default function AiPanel() {
   }
 
   const send = async (overrideText?: string, isContinuation?: boolean) => {
-    const text = (overrideText ?? input).trim()
-    if (!text || aiLoading) return
+    // For continuations, the "text" isn't user-typed input at all — it's just
+    // a trigger to resume streaming. Don't fall through to `input` (which may
+    // be empty) and don't bail out on an empty string the way normal sends do.
+    const text = isContinuation ? (overrideText ?? '') : (overrideText ?? input).trim()
+    if (isContinuation) {
+      // Continuation has no "user typed text" requirement — only block if
+      // something is already streaming.
+      if (aiLoading) return
+    } else {
+      if (!text || aiLoading) return
+    }
 
     const mode = settings.activeMode || 'ask'
     const skills = isContinuation ? [] : detectSkills(text)
 
-    if (!overrideText) { setInput(""); setShowCommands(false) }
+    if (!overrideText && !isContinuation) { setInput(""); setShowCommands(false) }
 
     // Agent mode: mark agent as running and ensure the dedicated terminal exists
     if (mode === 'agent') {
@@ -885,7 +894,7 @@ Important rules for Agent mode:
               addCheckpoint({
                 id: Math.random().toString(),
                 timestamp: Date.now(),
-                mode, userMessage: text, aiResponse: fullText,
+                mode, userMessage: isContinuation ? '(continued)' : text, aiResponse: fullText,
                 skillsApplied: skills.map(s => s.name),
                 agentSteps: [...agentSteps],
                 planSteps,
@@ -1171,7 +1180,7 @@ Important rules for Agent mode:
         addCheckpoint({
           id: Math.random().toString(),
           timestamp: Date.now(),
-          mode, userMessage: text, aiResponse: fullText,
+          mode, userMessage: isContinuation ? '(continued)' : text, aiResponse: fullText,
           skillsApplied: skills.map(s => s.name),
           agentSteps: [],
           planSteps,

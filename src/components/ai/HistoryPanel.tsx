@@ -1,6 +1,6 @@
 import { useHistoryStore, Checkpoint } from '../../stores/historyStore'
 import { useStore } from '../../stores/appStore'
-import { X, Clock, Map, Bot, MessageSquare, RotateCcw, Download, Trash2 } from 'lucide-react'
+import { X, Clock, Map as MapIcon, Bot, MessageSquare, RotateCcw, Download, Trash2 } from 'lucide-react'
 
 interface Props {
   onClose: () => void
@@ -59,7 +59,7 @@ export default function HistoryPanel({ onClose }: Props) {
                 <div className="card-top">
                   <span className="timestamp">{new Date(cp.timestamp).toLocaleTimeString()}</span>
                   <div className="badges">
-                    {cp.mode === 'plan' && <span className="mode-badge plan"><Map size={10}/></span>}
+                    {cp.mode === 'plan' && <span className="mode-badge plan"><MapIcon size={10}/></span>}
                     {cp.mode === 'agent' && <span className="mode-badge agent"><Bot size={10}/></span>}
                     {cp.mode === 'ask' && <span className="mode-badge ask"><MessageSquare size={10}/></span>}
                   </div>

@@ -1,12 +1,12 @@
 import { useStore, ChatMode } from '../../stores/appStore'
-import { Map, Bot, MessageSquare } from 'lucide-react'
+import { Bot, MessageSquare, Map as MapIcon } from 'lucide-react'
 
 export default function ChatModeSelector() {
   const { settings, updateSettings } = useStore()
   const activeMode = settings.activeMode || 'ask'
 
   const modes: { id: ChatMode; name: string; icon: any; label: string }[] = [
-    { id: 'plan', name: 'Plan', icon: Map, label: '🗺️ Plan' },
+    { id: 'plan', name: 'Plan', icon: MapIcon, label: '🗺️ Plan' },
     { id: 'agent', name: 'Agent', icon: Bot, label: '🤖 Agent' },
     { id: 'ask', name: 'Ask', icon: MessageSquare, label: '💬 Ask' },
   ]

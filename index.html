@@ -38,12 +38,39 @@
   <div id="root"></div>
   <script type="module" src="/src/main.tsx"></script>
   <script>
-    window.addEventListener('load', () => {
-      setTimeout(() => {
-        const splash = document.getElementById('splash')
-        if (splash) { splash.style.opacity = '0'; setTimeout(() => splash.remove(), 300) }
-      }, 800)
-    })
+    (function () {
+      var splashRemoved = false
+
+      function removeSplash() {
+        if (splashRemoved) return
+        splashRemoved = true
+        var splash = document.getElementById('splash')
+        if (splash) {
+          splash.style.opacity = '0'
+          setTimeout(function () { splash.remove() }, 300)
+        }
+      }
+
+      // Primary path: React dispatches this once it has actually mounted
+      // and committed its first paint (see App.tsx's startup effect).
+      window.addEventListener('codedroid-app-ready', function () {
+        // Small delay so the splash's own fade-in/branding is visible briefly
+        // rather than flashing instantly on fast machines.
+        setTimeout(removeSplash, 400)
+      })
+
+      // Safety fallback: if for any reason the app-ready event never fires
+      // (e.g. a startup crash, slow preload, or hung sidecar handshake),
+      // never leave the user staring at a black screen indefinitely.
+      // The splash itself gets removed so at least the error/blank #root
+      // is visible and DevTools/console can be inspected.
+      setTimeout(function () {
+        if (!splashRemoved) {
+          console.warn('[CodeDroid] App did not signal ready within 8s — removing splash anyway to avoid a stuck black screen.')
+          removeSplash()
+        }
+      }, 8000)
+    })()
   </script>
 </body>
 </html>

@@ -24,6 +24,11 @@ export default function App() {
     const saved = themes.find(t => t.id === settings.themeId) || themes[0]
     applyTheme(saved)
 
+    // Signal to index.html that React has actually mounted and painted —
+    // this removes the splash screen instead of a blind window.load timer,
+    // which could fire before #root has any content (causing a black screen).
+    window.dispatchEvent(new Event('codedroid-app-ready'))
+
     // Auto-fetch models with a slight delay to allow sidecar to boot
     const timer = setTimeout(() => {
       fetchModels('ollama')
