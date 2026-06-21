@@ -4,6 +4,7 @@ import { X, Circle, ChevronRight, SplitSquareHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
 import { applyErrorDecorations, clearErrorDecorations } from './ErrorDecorations'
 import ProblemsPanel from './ProblemsPanel'
+import PreviewButton from './PreviewButton'
 import './EditorArea.css'
 
 const LANG_ICON_COLOR: Record<string, string> = {
@@ -15,26 +16,29 @@ const LANG_ICON_COLOR: Record<string, string> = {
 function TabBar() {
   const { openFiles, activeFileIndex, closeFile, setActiveFile, saveFile } = useStore()
   return (
-    <div className="tab-bar">
-      {openFiles.map((file, i) => (
-        <div
-          key={file.path}
-          className={`tab ${i === activeFileIndex ? 'active' : ''}`}
-          onClick={() => setActiveFile(i)}
-          onMouseDown={e => { if (e.button === 1) { e.preventDefault(); closeFile(i) } }}
-          title={file.path}
-        >
-          <span className="tab-lang-dot" style={{ background: LANG_ICON_COLOR[file.language] || '#888' }} />
-          <span className="tab-name">{file.name}</span>
-          <button
-            className="tab-close"
-            onClick={e => { e.stopPropagation(); closeFile(i) }}
-            title={file.isDirty ? 'Unsaved changes' : 'Close'}
+    <div className="tab-bar-row">
+      <div className="tab-bar">
+        {openFiles.map((file, i) => (
+          <div
+            key={file.path}
+            className={`tab ${i === activeFileIndex ? 'active' : ''}`}
+            onClick={() => setActiveFile(i)}
+            onMouseDown={e => { if (e.button === 1) { e.preventDefault(); closeFile(i) } }}
+            title={file.path}
           >
-            {file.isDirty ? <Circle size={8} fill="currentColor" /> : <X size={10} />}
-          </button>
-        </div>
-      ))}
+            <span className="tab-lang-dot" style={{ background: LANG_ICON_COLOR[file.language] || '#888' }} />
+            <span className="tab-name">{file.name}</span>
+            <button
+              className="tab-close"
+              onClick={e => { e.stopPropagation(); closeFile(i) }}
+              title={file.isDirty ? 'Unsaved changes' : 'Close'}
+            >
+              {file.isDirty ? <Circle size={8} fill="currentColor" /> : <X size={10} />}
+            </button>
+          </div>
+        ))}
+      </div>
+      <PreviewButton />
     </div>
   )
 }

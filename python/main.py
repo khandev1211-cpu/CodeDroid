@@ -43,6 +43,13 @@ except ImportError:
     def has_incomplete_code_block(t): return False
     def merge_continuations(a, b): return a + "\n" + b
 
+try:
+    from browser_agent import get_browser_agent, reset_browser_agent, PLAYWRIGHT_AVAILABLE
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    def get_browser_agent(): raise RuntimeError("browser_agent module not available")
+    async def reset_browser_agent(): raise RuntimeError("browser_agent module not available")
+
 app = FastAPI(title="CodeDroid AI Sidecar", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -1134,6 +1141,68 @@ File content:
             return r.json()["message"]["content"]
 
 
+async def _get_ai_completion(system: str, prompt: str, api_key: str, provider: str, model: str, host: str = "http://localhost:11434", max_tokens: int = 4096) -> str:
+    """Generic single-turn AI completion helper, used by the Live Preview / Edit Mode system."""
+    messages = [{"role": "user", "content": prompt}]
+    async with httpx.AsyncClient(timeout=60) as client:
+        if provider == "groq":
+            m = model or "llama-3.3-70b-versatile"
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": m, "max_tokens": min(max_tokens, GROQ_MAX_TOKENS.get(m, 2000)),
+                      "messages": [{"role": "system", "content": system}] + messages},
+            )
+            data = r.json()
+            if "choices" not in data:
+                raise RuntimeError(data.get("error", {}).get("message", "Groq request failed"))
+            return data["choices"][0]["message"]["content"]
+
+        elif provider == "claude":
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model or "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+                      "system": system, "messages": messages},
+            )
+            data = r.json()
+            if "content" not in data:
+                raise RuntimeError(data.get("error", {}).get("message", "Claude request failed"))
+            return data["content"][0]["text"]
+
+        elif provider == "gemini":
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-1.5-pro'}:generateContent",
+                params={"key": api_key},
+                json={"system_instruction": {"parts": [{"text": system}]},
+                      "contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+            )
+            data = r.json()
+            if "candidates" not in data:
+                raise RuntimeError(data.get("error", {}).get("message", "Gemini request failed"))
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        else:  # ollama
+            r = await client.post(f"{host}/api/chat", json={
+                "model": model or "llama3", "stream": False,
+                "messages": [{"role": "system", "content": system}] + messages,
+            })
+            return r.json()["message"]["content"]
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip accidental markdown fences from an AI response expected to be raw JSON or file content."""
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        t = "\n".join(lines)
+    return t.strip()
+
+
 async def _run_command_capture(command: str, workspace: str) -> dict:
     """Run a shell command and return structured result with error detection."""
     cwd = workspace or _workspace_root or None
@@ -1327,6 +1396,282 @@ async def websocket_agent_fix(ws: WebSocket):
             await ws.send_text(json.dumps({"type": "done"}))
         except Exception:
             pass
+
+
+# ─── Live Preview + Edit Mode System ───────────────────────────────────────────
+
+class StartPreviewRequest(BaseModel):
+    url: str = ""                 # direct URL to open (static HTML file:// or already-running server)
+    dev_command: str = ""         # e.g. "npm run dev" — if set, spawns a dev server first
+    workspace: str = ""
+    ready_url: str = ""           # URL to poll until the dev server is ready (used with dev_command)
+    width: int = 1280
+    height: int = 800
+
+
+@app.post("/preview/start")
+async def preview_start(req: StartPreviewRequest):
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"ok": False, "error": "Playwright is not installed. Run: pip install playwright && playwright install chromium"}
+
+    agent = await reset_browser_agent()
+    workspace = req.workspace or _workspace_root
+
+    try:
+        target_url = req.url
+        if req.dev_command:
+            ready = await agent.start_dev_server(req.dev_command, workspace, req.ready_url or req.url, timeout=30)
+            if not ready:
+                return {"ok": False, "error": "Dev server did not become ready within 30s"}
+            target_url = req.ready_url or req.url
+
+        if not target_url:
+            return {"ok": False, "error": "No URL or dev command provided"}
+
+        await agent.start(target_url, req.width, req.height)
+        return {"ok": True, "url": target_url}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/preview/stop")
+async def preview_stop():
+    agent = get_browser_agent()
+    await agent.stop()
+    return {"ok": True}
+
+
+@app.post("/preview/reload")
+async def preview_reload():
+    agent = get_browser_agent()
+    try:
+        await agent.reload()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/preview/navigate")
+async def preview_navigate(body: dict):
+    agent = get_browser_agent()
+    try:
+        await agent.navigate(body.get("url", ""))
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class ElementEditRequest(BaseModel):
+    element: dict                  # element_data from the click event
+    prompt: str
+    provider: str = "groq"
+    api_key: str = ""
+    model: str = ""
+    host: str = "http://localhost:11434"
+
+
+@app.websocket("/ws/preview")
+async def websocket_preview(ws: WebSocket):
+    """
+    Single long-lived WebSocket per preview session. Handles:
+      client → server: { type: "enable_edit_mode" }
+                        { type: "disable_edit_mode" }
+                        { type: "submit_edit", element, prompt, provider, api_key, model, host }
+                        { type: "save_changes", file_path, provider, api_key, model, host }
+                        { type: "discard_changes" }
+                        { type: "discard_single", index }
+      server → client: { type: "element_clicked", data }
+                        { type: "edit_applying" }
+                        { type: "element_edit_preview", change, element_data }
+                        { type: "edit_error", message }
+                        { type: "changes_saved", file_path }
+                        { type: "changes_discarded" }
+                        { type: "pending_changes", changes }
+                        { type: "console", level, text }
+                        { type: "preview_closed" }
+    """
+    await ws.accept()
+    agent = get_browser_agent()
+
+    loop = asyncio.get_event_loop()
+
+    async def forward_element_clicked(data: dict):
+        await ws.send_text(json.dumps({"type": "element_clicked", "data": data}))
+
+    async def forward_console(level: str, text: str):
+        await ws.send_text(json.dumps({"type": "console", "level": level, "text": text[:500]}))
+
+    async def forward_closed():
+        await ws.send_text(json.dumps({"type": "preview_closed"}))
+
+    agent.on_element_clicked = forward_element_clicked
+    agent.on_console = forward_console
+    agent.on_closed = forward_closed
+
+    # Element data from the most recent click, keyed by selector, so submit_edit
+    # (which may arrive from either the in-page floating input OR the chat panel)
+    # always has the right context.
+    pending_element: dict | None = None
+
+    async def emit_pending_changes():
+        await ws.send_text(json.dumps({
+            "type": "pending_changes",
+            "changes": agent.pending_changes,
+        }))
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "enable_edit_mode":
+                await agent.enable_edit_mode()
+                await ws.send_text(json.dumps({"type": "edit_mode_enabled"}))
+
+            elif msg_type == "disable_edit_mode":
+                await agent.disable_edit_mode()
+                await ws.send_text(json.dumps({"type": "edit_mode_disabled"}))
+
+            elif msg_type == "element_context":
+                # Frontend can push the last-clicked element explicitly
+                # (e.g. when the user types in the chat panel instead of the
+                # in-page floating input) so submit_edit has context.
+                pending_element = msg.get("element")
+
+            elif msg_type == "submit_edit":
+                element = msg.get("element") or pending_element
+                prompt = msg.get("prompt", "")
+                if not element:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": "No element selected"}))
+                    continue
+
+                await ws.send_text(json.dumps({"type": "edit_applying"}))
+
+                system_prompt = (
+                    "You are editing a live webpage element. Respond with ONLY a JSON object "
+                    "describing the DOM change to make. No explanation, no markdown fences.\n\n"
+                    f"Element being edited:\n"
+                    f"- Tag: {element.get('tag')}\n"
+                    f"- Current text: {element.get('text')}\n"
+                    f"- Current HTML: {element.get('html')}\n"
+                    f"- Selector: {element.get('selector')}\n\n"
+                    f'User request: "{prompt}"\n\n'
+                    "Respond with this exact JSON structure:\n"
+                    "{\n"
+                    '  "action": "set_text" | "set_html" | "set_attribute" | "remove" | "set_style",\n'
+                    f'  "selector": "{element.get("selector")}",\n'
+                    '  "value": "the new value to apply",\n'
+                    '  "attribute_name": "only present if action is set_attribute"\n'
+                    "}"
+                )
+
+                try:
+                    ai_response = await _get_ai_completion(
+                        system=system_prompt, prompt=prompt,
+                        api_key=msg.get("api_key", ""), provider=msg.get("provider", "groq"),
+                        model=msg.get("model", ""), host=msg.get("host", "http://localhost:11434"),
+                        max_tokens=800,
+                    )
+                    clean = _strip_json_fences(ai_response)
+                    change = json.loads(clean)
+                    change.setdefault("selector", element.get("selector"))
+                except Exception as e:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": f"AI did not return valid change JSON: {e}"}))
+                    continue
+
+                try:
+                    await agent.apply_dom_change(change)
+                except Exception as e:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": str(e)}))
+                    continue
+
+                await ws.send_text(json.dumps({
+                    "type": "element_edit_preview",
+                    "change": change,
+                    "element_data": element,
+                }))
+                await emit_pending_changes()
+
+            elif msg_type == "discard_single":
+                idx = msg.get("index", -1)
+                agent.remove_pending_change(idx)
+                await agent.clear_editing_outline()
+                await emit_pending_changes()
+
+            elif msg_type == "discard_changes":
+                await agent.reload()
+                agent.clear_pending_changes()
+                await ws.send_text(json.dumps({"type": "changes_discarded"}))
+                await emit_pending_changes()
+
+            elif msg_type == "save_changes":
+                if not agent.pending_changes:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": "No pending changes to save"}))
+                    continue
+
+                file_path = msg.get("file_path", "")
+                if not file_path:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": "No file path provided to save to"}))
+                    continue
+
+                resolved_path = _resolve_path(file_path)
+                try:
+                    current_html = Path(resolved_path).read_text(encoding="utf-8")
+                except Exception as e:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": f"Could not read {file_path}: {e}"}))
+                    continue
+
+                save_system_prompt = (
+                    "You are applying visual-editor DOM changes back to an HTML source file. "
+                    "Make minimal, surgical edits — only change what corresponds to the listed DOM "
+                    "changes. Preserve all formatting, indentation, comments, and unrelated code "
+                    "exactly as-is. Return ONLY the complete updated file content, nothing else — "
+                    "no explanation, no markdown fences."
+                )
+                save_prompt = (
+                    f"DOM changes made during visual editing:\n{json.dumps(agent.pending_changes, indent=2)}\n\n"
+                    f"Current file content:\n{current_html}"
+                )
+
+                try:
+                    updated_html = await _get_ai_completion(
+                        system=save_system_prompt, prompt=save_prompt,
+                        api_key=msg.get("api_key", ""), provider=msg.get("provider", "groq"),
+                        model=msg.get("model", ""), host=msg.get("host", "http://localhost:11434"),
+                        max_tokens=8000,
+                    )
+                    updated_html = _strip_json_fences(updated_html)
+                except Exception as e:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": f"AI failed to apply changes to file: {e}"}))
+                    continue
+
+                try:
+                    Path(resolved_path).write_text(updated_html, encoding="utf-8")
+                except Exception as e:
+                    await ws.send_text(json.dumps({"type": "edit_error", "message": f"Could not write {file_path}: {e}"}))
+                    continue
+
+                # Flash green confirmation on the most recently edited selector(s)
+                for change in agent.pending_changes:
+                    await agent.flash_saved(change.get("selector", ""))
+
+                agent.clear_pending_changes()
+
+                await ws.send_text(json.dumps({
+                    "type": "changes_saved",
+                    "file_path": file_path,
+                    "previous_content": current_html,
+                    "new_content": updated_html,
+                }))
+                await emit_pending_changes()
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        agent.on_element_clicked = None
+        agent.on_console = None
+        agent.on_closed = None
 
 
 if __name__ == "__main__":

@@ -37,6 +37,21 @@ export interface InlineError {
   message: string
 }
 
+export interface ElementData {
+  selector: string
+  tag: string
+  text: string
+  html: string
+  rect: { x: number; y: number; width: number; height: number }
+}
+
+export interface DomChange {
+  action: 'set_text' | 'set_html' | 'set_attribute' | 'remove' | 'set_style'
+  selector: string
+  value: any
+  attribute_name?: string
+}
+
 export interface PlanStep {
   id: string
   title: string
@@ -158,6 +173,15 @@ interface AppStore {
   agentTerminalId: string | null       // ID of the dedicated 🤖 Agent terminal tab
   inlineErrors: InlineError[]          // errors to show in Monaco decorations
 
+  // Live Preview + Edit Mode
+  previewActive: boolean
+  previewUrl: string | null
+  previewFilePath: string | null       // source file the preview corresponds to, for Save
+  editModeActive: boolean
+  editingElement: ElementData | null   // currently-selected element (chip context)
+  pendingChanges: DomChange[]
+  previewConsole: { level: string; text: string }[]
+
   // Git
   gitFiles: GitFileStatus[]
   gitBranch: string
@@ -214,6 +238,14 @@ interface AppStore {
   clearInlineErrors: () => void
   setAgentStatus: (step: number, total: number, tool: string) => void
   setAgentWebSocket: (ws: WebSocket | null) => void
+
+  // Actions: Live Preview + Edit Mode
+  setPreviewActive: (active: boolean, url?: string | null, filePath?: string | null) => void
+  setEditModeActive: (active: boolean) => void
+  setEditingElement: (el: ElementData | null) => void
+  setPendingChanges: (changes: DomChange[]) => void
+  addPreviewConsole: (level: string, text: string) => void
+  clearPreviewConsole: () => void
   pauseAgent: () => void
   stopAgent: () => void
   resetAgentState: () => void
@@ -274,6 +306,9 @@ export const useStore = create<AppStore>()(
       agentRunning: false, agentPaused: false, agentCurrentStep: 0,
       agentTotalSteps: 0, agentCurrentTool: '', agentWebSocket: null,
       agentTerminalId: null, inlineErrors: [],
+
+      previewActive: false, previewUrl: null, previewFilePath: null,
+      editModeActive: false, editingElement: null, pendingChanges: [], previewConsole: [],
       gitFiles: [], gitBranch: 'main', gitLog: [], commitMessage: '',
       searchQuery: '', searchResults: [], searchLoading: false, replaceQuery: '',
       terminalTabs: [{ id: 'term_1', name: 'Terminal 1' }], activeTerminalTab: 'term_1',
@@ -404,6 +439,22 @@ export const useStore = create<AppStore>()(
       clearInlineErrors: () => set({ inlineErrors: [] }),
       setAgentStatus: (step, total, tool) => set({ agentCurrentStep: step, agentTotalSteps: total, agentCurrentTool: tool }),
       setAgentWebSocket: (ws) => set({ agentWebSocket: ws }),
+
+      // ── Live Preview + Edit Mode actions ───────────────────────────────────
+      setPreviewActive: (active, url, filePath) => set({
+        previewActive: active,
+        previewUrl: active ? (url ?? null) : null,
+        previewFilePath: active ? (filePath ?? null) : null,
+        ...(active ? {} : { editModeActive: false, editingElement: null, pendingChanges: [] }),
+      }),
+      setEditModeActive: (active) => set({ editModeActive: active, ...(active ? {} : { editingElement: null }) }),
+      setEditingElement: (el) => set({ editingElement: el }),
+      setPendingChanges: (changes) => set({ pendingChanges: changes }),
+      addPreviewConsole: (level, text) => set((s) => ({
+        previewConsole: [...s.previewConsole.slice(-99), { level, text }],
+      })),
+      clearPreviewConsole: () => set({ previewConsole: [] }),
+
       pauseAgent: () => {
         const { agentWebSocket, agentPaused } = get()
         const newPaused = !agentPaused

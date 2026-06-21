@@ -4,7 +4,7 @@ import {
   ChevronDown, RefreshCw, Sparkles, Map as MapIcon, History,
   Play, Pause, Square, ChevronRight, Wrench, Brain,
 } from "lucide-react"
-import { useStore, AiProvider, AiMessage, PlanStep, AgentStep } from "../../stores/appStore"
+import { useStore, AiProvider, AiMessage, PlanStep, AgentStep, ElementData, DomChange } from "../../stores/appStore"
 import { useHistoryStore } from "../../stores/historyStore"
 import { detectSkills, buildSystemPrompt } from "./SkillEngine"
 import { Skill } from "../../skills/skillRegistry"
@@ -13,6 +13,9 @@ import PromptEnhancer from "./PromptEnhancer"
 import HistoryPanel from "./HistoryPanel"
 import ThinkingBlock from "./ThinkingBlock"
 import TokenLimitPopup from "./TokenLimitPopup"
+import ElementEditActions from "./ElementEditActions"
+import PendingChangesPanel from "./PendingChangesPanel"
+import { getPreviewSocket } from "../editor/PreviewButton"
 import "./AiPanel.css"
 
 // ── Provider config ─────────────────────────────────────────────────────────
@@ -480,6 +483,7 @@ export default function AiPanel() {
     settings, updateSettings, addAiMessage, updateAiMessage, setAiLoading,
     enhancerLoading, setInlineErrors, clearInlineErrors,
     addAgentTerminal, folderPath,
+    previewActive, editModeActive, editingElement, setEditingElement, pendingChanges,
   } = useStore()
   const { addCheckpoint } = useHistoryStore()
 
@@ -490,6 +494,8 @@ export default function AiPanel() {
   const [isErrorMode, setIsErrorMode] = useState(false)
   const [errorBannerDismissed, setErrorBannerDismissed] = useState(false)
   const [useDeepThink, setUseDeepThink] = useState(false)
+  const [pendingEditPreview, setPendingEditPreview] = useState<{ change: DomChange; element: ElementData } | null>(null)
+  const [editSubmitting, setEditSubmitting] = useState(false)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
@@ -525,6 +531,27 @@ export default function AiPanel() {
     window.addEventListener('codedroid-continue-response', handler)
     return () => window.removeEventListener('codedroid-continue-response', handler)
   }, [])
+
+  // Listen for live preview DOM-edit results — shows Save/Discard inline in chat
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { change, element } = (e as CustomEvent).detail
+      setPendingEditPreview({ change, element })
+      setEditSubmitting(false)
+      addAiMessage({
+        role: 'assistant',
+        content: `Applied **${change.action.replace(/_/g, ' ')}** to \`${element.tag}\` — visible live in the preview now.`,
+        provider: settings.activeProvider, mode: 'ask', isStreaming: false,
+      })
+    }
+    window.addEventListener('codedroid-preview-edit-applied', handler)
+    return () => window.removeEventListener('codedroid-preview-edit-applied', handler)
+  }, [settings.activeProvider])
+
+  // Clear the inline Save/Discard card once all pending changes are resolved
+  useEffect(() => {
+    if (pendingChanges.length === 0) setPendingEditPreview(null)
+  }, [pendingChanges.length])
 
   // Paste detection — check if pasted text looks like an error report
   const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -643,6 +670,30 @@ export default function AiPanel() {
         ws.onerror = () => { setAiLoading(false); useStore.getState().setAgentRunning(false); ws.close(); resolve() }
       } catch { setAiLoading(false); useStore.getState().setAgentRunning(false); resolve() }
     })
+  }
+
+  // Submit an edit prompt for the currently-selected preview element.
+  // Used by the chat input when an element chip is active (Feature 2/3 sync rule:
+  // whichever input — in-page floating box or this chat box — submits first wins;
+  // the in-page popup closes itself on submit from its own JS).
+  const submitElementEdit = (prompt: string) => {
+    const ws = getPreviewSocket()
+    if (!ws || ws.readyState !== WebSocket.OPEN || !editingElement) return
+    const provider = settings.activeProvider
+    const apiKey = provider === 'groq' ? settings.groqKey : provider === 'gemini' ? settings.geminiKey : provider === 'claude' ? settings.claudeKey : ''
+    const model = provider === 'groq' ? settings.groqModel : provider === 'gemini' ? settings.geminiModel : provider === 'claude' ? settings.claudeModel : settings.ollamaModel
+
+    setEditSubmitting(true)
+    addAiMessage({ role: 'user', content: prompt, provider, mode: 'ask', isStreaming: false })
+
+    ws.send(JSON.stringify({
+      type: 'submit_edit',
+      element: editingElement,
+      prompt,
+      provider, api_key: apiKey, model, host: settings.ollamaHost,
+    }))
+
+    setInput("")
   }
 
   const send = async (overrideText?: string, isContinuation?: boolean) => {
@@ -1211,7 +1262,14 @@ Important rules for Agent mode:
   useEffect(() => { sendRef.current = send })
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send() }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault()
+      if (editingElement && input.trim()) {
+        submitElementEdit(input.trim())
+      } else {
+        send()
+      }
+    }
     if (e.ctrlKey && e.key === '1') { e.preventDefault(); updateSettings({ activeMode: 'plan' }) }
     if (e.ctrlKey && e.key === '2') { e.preventDefault(); updateSettings({ activeMode: 'agent' }) }
     if (e.ctrlKey && e.key === '3') { e.preventDefault(); updateSettings({ activeMode: 'ask' }) }
@@ -1272,8 +1330,23 @@ Important rules for Agent mode:
         {aiLoading && (!aiMessages.length || aiMessages[aiMessages.length-1].role !== 'assistant' || !aiMessages[aiMessages.length-1].content) && (
           <BeautifulLoading />
         )}
+
+        {/* Live preview edit result card — Save/Discard for the most recent edit */}
+        {pendingEditPreview && pendingChanges.length > 0 && (
+          <ElementEditActions change={pendingEditPreview.change} elementData={pendingEditPreview.element} />
+        )}
+
         <div ref={bottomRef} />
       </div>
+
+      {/* Editing element chip — shown when a preview element is selected for editing */}
+      {editingElement && (
+        <div className="editing-element-chip">
+          🎯 Editing: <code>{editingElement.tag}</code> "{editingElement.text.slice(0, 40)}"
+          {editSubmitting && <Loader2 size={11} className="spin" style={{ marginLeft: 4 }} />}
+          <button onClick={() => setEditingElement(null)} title="Clear selection">✕</button>
+        </div>
+      )}
 
       {/* Error paste banner */}
       {isErrorMode && !errorBannerDismissed && (
@@ -1309,7 +1382,9 @@ Important rules for Agent mode:
       <div className="ai-input-area">
         <div className={`ai-input-wrap ${enhancerLoading ? 'enhancing' : ''} ${isErrorMode ? 'error-mode-input' : ''}`}>
           <textarea ref={inputRef} className="ai-input"
-            placeholder={isErrorMode
+            placeholder={editingElement
+              ? `Describe the change to ${editingElement.tag}...`
+              : isErrorMode
               ? `Paste the error here or describe what to fix...`
               : `Ask AI in ${settings.activeMode || 'ask'} mode...`}
             value={input}
@@ -1334,7 +1409,11 @@ Important rules for Agent mode:
               <Brain size={13} />
               {useDeepThink && <span className="deep-think-label">Deep Think</span>}
             </button>
-            <button className="ai-send-btn" onClick={send} disabled={!input.trim() || aiLoading}>
+            <button
+              className="ai-send-btn"
+              onClick={() => editingElement && input.trim() ? submitElementEdit(input.trim()) : send()}
+              disabled={!input.trim() || aiLoading}
+            >
               {aiLoading ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
             </button>
           </div>
@@ -1350,6 +1429,8 @@ Important rules for Agent mode:
           </span>
         </div>
       </div>
+
+      <PendingChangesPanel />
     </div>
   )
 }
