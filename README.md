@@ -23,9 +23,10 @@
 ## 🗂 Table of Contents
 
 - [Overview](#-overview)
+- [Key Features](#-key-features)
 - [Architecture](#-architecture)
 - [Tech Stack](#-tech-stack)
-- [AI Providers](#-ai-providers)
+- [AI Providers & Reasoning](#-ai-providers--reasoning)
 - [Agentic Tools](#-agentic-tools)
 - [Themes](#-themes)
 - [Keyboard Shortcuts](#-keyboard-shortcuts)
@@ -36,15 +37,29 @@
 
 ## 🌟 Overview
 
-CodeDroid v3 is a **fully-featured, AI-native desktop IDE** that puts 4 AI providers, 11 agentic tools, and Monaco Editor (the engine behind VS Code) directly in your hands — on Windows, macOS, and Linux.
+CodeDroid v3 is a **fully-featured, AI-native desktop IDE** that integrates 4 major AI providers, 11 autonomous agentic tools, a live visual edit mode, and Monaco Editor (the engine behind VS Code) — natively on Windows, macOS, and Linux.
 
-| | |
+| Core Engine | Description |
 |---|---|
-| 🧠 **AI Copilot** | 4 providers, streaming, 8 slash commands |
-| ⚡ **Monaco Editor** | VS Code's core — full IntelliSense |
-| 🦀 **Rust Engine** | Ripgrep-style search, git2 diff, fast FS |
-| 🎨 **16 Themes** | 8 classic + 6 original exclusive themes |
-| 🖥 **Cross-platform** | Windows · macOS · Linux |
+| 🧠 **AI Copilot** | 4 providers (Groq, Gemini, Claude, Ollama) with real-time streaming, 8 slash commands, and CoT reasoning. |
+| 🌐 **Live Visual Preview** | Playwright-driven Chromium browser with click-to-edit DOM selectors and AI-driven source code patching. |
+| 🛠️ **Autonomous Auto-Fix** | Closed-loop script debugger: runs shell tasks, auto-detects compile/runtime errors, writes minimal surgical fixes, and verifies. |
+| ⚡ **Monaco Editor** | VS Code's core text engine, providing syntax highlighting, tabs, breadcrumbs, and full IntelliSense. |
+| 🦀 **Rust Addon** | Native performance for ignores, ripgrep-style full-text searches, and `libgit2`-based file differences. |
+| 🎨 **15 Themes** | 8 classic dark/light palettes + 6 exclusive high-contrast and neon themes (e.g. Void Black, Aurora Borealis). |
+
+---
+
+## 🚀 Key Features
+
+### 1. Visual Edit Mode (Live Preview)
+Run your web app directly inside the integrated browser view driven by Playwright. Toggle **Edit Mode** to hover and select any element on your page, type a prompt into the floating UI input, and let the AI patch the live DOM. When satisfied, click **Save** to write the modifications back to your local HTML/source file surgically, preserving all formatting and comments.
+
+### 2. Autonomous Auto-Fix Loop
+Runs compilation, test commands, or execution scripts directly in a dedicated tab. If a crash or exit code is detected, the `error_detector` parses the stderr traceback, maps it to a file, line, and column, prompts the LLM for a surgical fix, overwrites the file, and re-runs the task. Recurs up to 3 times or until the test suite passes.
+
+### 3. Collapsible Chain-of-Thought (CoT)
+Supports native reasoning models (DeepSeek-R1, Qwen-QwQ, Gemini Flash-Thinking) or injects specialized CoT instructions for standard models. Thinking streams are automatically parsed and rendered inside collapsible reasoning blocks in the AI Chat Panel.
 
 ---
 
@@ -55,23 +70,26 @@ codedroid/
 ├── src/                        # TypeScript + React (Electron renderer)
 │   ├── components/
 │   │   ├── editor/             # Monaco Editor, tabs, breadcrumbs
-│   │   ├── ai/                 # AI Copilot panel (4 providers, streaming)
-│   │   ├── sidebar/            # Files, Search, Git, Extensions, Settings
+│   │   ├── ai/                 # AI Copilot panel (ask/plan/agent modes)
+│   │   ├── sidebar/            # Files, Search, Git, Settings
 │   │   └── terminal/           # xterm.js multi-tab terminal
-│   ├── stores/                 # Zustand global state
-│   ├── themes/                 # 16 themes (8 classic + 6 originals)
-│   └── types/                  # TypeScript declarations
+│   ├── stores/                 # Zustand global state persistence
+│   ├── themes/                 # 15 themes (8 classic + 1 light + 6 originals)
+│   └── types/                  # TypeScript declaration files
 │
 ├── electron/                   # Electron main process + IPC handlers
-│   ├── main.js                 # Window, IPC, Python sidecar boot
-│   └── preload.js              # Secure IPC bridge (contextBridge)
+│   ├── main.js                 # Window shell, node-pty terminal tabs, Python boot
+│   └── preload.js              # Secure IPC bridge (contextBridge window.api)
 │
 ├── python/                     # FastAPI AI sidecar
-│   ├── main.py                 # AI streaming, 11 agentic tools, WebSocket
+│   ├── main.py                 # WebSocket chat routing, tool execution, auto-fix
+│   ├── error_detector.py       # Regex traceback/exit code classifier
+│   ├── thinking_detector.py    # CoT reasoning controller and token trimmer
+│   ├── browser_agent.py        # Playwright live preview controller
 │   └── requirements.txt
 │
 └── crates/core/                # Rust native addon (napi-rs)
-    └── src/lib.rs              # FS walk, full-text search, git2 diff
+    └── src/lib.rs              # ignore-walking, full-text search, git2 diffs
 ```
 
 ---
@@ -83,27 +101,28 @@ codedroid/
 | 🖥 Shell | Electron 29 |
 | 🎨 UI | React 18 + Vite 5 |
 | ✏️ Editor | Monaco Editor (VS Code's core engine) |
-| 💻 Terminal | xterm.js (multi-tab) |
-| 🗃 State | Zustand |
-| 🤖 AI Backend | FastAPI + httpx (Python 3.10+) |
-| 🔍 FS / Search / Git | Rust — napi-rs · ignore · regex · git2 |
+| 💻 Terminal | xterm.js (multi-tab node-pty stream) |
+| 🗃 State | Zustand (Persisted via `electron-store`) |
+| 🤖 AI Sidecar | FastAPI + httpx + Uvicorn (Python 3.10+) |
+| 🔍 FS / Git / Search | Rust — napi-rs · ignore · regex · git2 |
+| 🌐 Live Preview | Playwright (Chromium) |
 
 ---
 
-## 🤖 AI Providers
+## 🤖 AI Providers & Reasoning
 
-All providers support **real-time streaming** directly in the editor panel.
+All providers support real-time token streaming, agentic function-calling, and custom Chain-of-Thought (CoT) tracking.
 
-| Provider | Streaming | Available Models |
-|---|---|---|
-| **Groq** | ✅ SSE | llama3-70b, mixtral, gemma2 |
-| **Gemini** | ✅ Batch | gemini-1.5-pro, gemini-flash |
-| **Claude (Anthropic)** | ✅ SSE | claude-sonnet-4, opus, haiku |
-| **Ollama** | ✅ Stream | Any local model |
+| Provider | Streaming | Tool Use | Reasoning (CoT) |
+|---|---|---|---|
+| **Groq** | ✅ SSE | ✅ Native | ✅ Native / Injected |
+| **Gemini** | ✅ Batch/Stream | ✅ Prompt-injected | ✅ Native / Injected |
+| **Claude** | ✅ SSE | ✅ Native | ✅ Native (Budget config) |
+| **Ollama** | ✅ Stream | ✅ Prompt-injected | ✅ Native / Injected |
 
 ### ⌨️ Slash Commands
 
-Type these in the AI panel for instant actions:
+Type these in the AI panel for instant context-aware actions:
 
 | Command | Action |
 |---|---|
@@ -120,18 +139,16 @@ Type these in the AI panel for instant actions:
 
 ## 🔧 Agentic Tools (11)
 
-The Python sidecar executes these tools autonomously on behalf of the AI:
+The Python sidecar executes these tools autonomously on behalf of the AI inside **Agent Mode**:
 
 ```
 read_file     write_file    create_file   delete_file   make_dir
 list_files    run_command   run_python    pip_install   git_command   web_fetch
 ```
 
-> The AI can chain multiple tools together to complete complex tasks — reading files, running code, installing packages, and pushing git commits, all without leaving the IDE.
-
 ---
 
-## 🎨 Themes (16 Total)
+## 🎨 Themes (15 Total)
 
 ### 🌑 Classic Dark
 `VS Code Dark+` · `One Dark Pro` · `Dracula` · `Monokai Pro` · `Nord` · `GitHub Dark` · `Catppuccin Mocha` · `Tokyo Night`
@@ -140,15 +157,12 @@ list_files    run_command   run_python    pip_install   git_command   web_fetch
 `GitHub Light`
 
 ### ✨ Original Exclusive Themes
-
-| Theme | Vibe |
-|---|---|
-| **Void Black** | Pure black with neon red accents |
-| **Aurora Borealis** | Deep navy with electric green highlights |
-| **Sandstorm** | Warm desert browns with golden amber |
-| **Neon City** | Cyberpunk purple with hot pink & cyan |
-| **Sakura Dusk** | Soft pinks on dark rose backgrounds |
-| **Glacier** | Crisp ice blue — clean winter palette |
+*   **Void Black**: Pure black background with vibrant neon red accents.
+*   **Aurora Borealis**: Deep space navy with electric green and cyan highlights.
+*   **Sandstorm**: Warm desert browns with golden amber typography.
+*   **Neon City**: Cyberpunk purple with hot pink and cyan indicators.
+*   **Sakura Dusk**: Soft pinks on dark rose backgrounds.
+*   **Glacier**: Crisp ice blue and winter teal layout.
 
 ---
 
@@ -157,7 +171,7 @@ list_files    run_command   run_python    pip_install   git_command   web_fetch
 | Shortcut | Action |
 |---|---|
 | `Ctrl + S` | Save file |
-| `Ctrl + Shift + S` | Save all |
+| `Ctrl + Shift + S` | Save all files |
 | `Ctrl + Shift + P` | Command palette |
 | `Ctrl + B` | Toggle sidebar |
 | `Ctrl + J` | Toggle terminal |
@@ -184,8 +198,9 @@ npm install
 ```bash
 pip install -r python/requirements.txt
 ```
+*(Optionally setup Playwright: `pip install playwright && playwright install chromium`)*
 
-### 3. Build Rust addon *(optional — IDE works without it)*
+### 3. Build Rust addon *(optional — IDE works with JS fallback)*
 ```bash
 cd crates/core
 cargo build --release
@@ -212,7 +227,7 @@ npm run build
 | AI providers | 3 | 4 *(+ Claude)* |
 | Git diff | shell subprocess | libgit2 via Rust |
 | Platform | Windows only | Windows + macOS + Linux |
-| Themes | 13 | 16 *(+ 6 originals)* |
+| Themes | 13 | 15 *(+ 6 originals)* |
 
 ---
 
