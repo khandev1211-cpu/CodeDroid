@@ -133,9 +133,35 @@ EDIT_MODE_INSPECTOR_SCRIPT = r"""
 """
 
 # ─── Floating input injected at the clicked element's position ────────────────
-def _floating_input_script(rect: dict) -> str:
+# ─── Model catalogue for the floating input dropdown ──────────────────────────
+# Kept in sync with the React app's availableModels in appStore.ts.
+_MODEL_OPTIONS = {
+    "groq": [
+        "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant",
+        "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it",
+    ],
+    "gemini": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"],
+    "claude": [
+        "claude-sonnet-4-20250514", "claude-opus-4-20250514",
+        "claude-haiku-4-20250514", "claude-3-5-sonnet-20241022",
+    ],
+    "ollama": ["llama3", "mistral", "codellama", "deepseek-coder"],
+}
+
+def _floating_input_script(rect: dict, active_provider: str = "groq", active_model: str = "") -> str:
     top = rect["y"] + rect["height"] + 8
     left = rect["x"]
+
+    # Build <option> HTML grouped by provider
+    options_html = ""
+    for provider, models in _MODEL_OPTIONS.items():
+        label = provider.capitalize()
+        options_html += f'<optgroup label="{label}">'
+        for m in models:
+            sel = "selected" if (provider == active_provider and m == active_model) else ""
+            options_html += f'<option value="{provider}:{m}" {sel}>{m}</option>'
+        options_html += "</optgroup>"
+
     return f"""
 (() => {{
   const existing = document.getElementById('__codedroid_floating_input__');
@@ -147,27 +173,57 @@ def _floating_input_script(rect: dict) -> str:
     position: fixed;
     top: {top}px;
     left: {left}px;
-    background: #1a1a1a;
+    background: #1a1a2e;
     border: 1px solid #3b82f6;
-    border-radius: 8px;
-    padding: 8px;
+    border-radius: 10px;
+    padding: 10px;
     z-index: 2147483647;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(59,130,246,0.15);
     display: flex;
-    gap: 6px;
-    min-width: 280px;
-    font-family: -apple-system, sans-serif;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 340px;
+    font-family: -apple-system, 'Segoe UI', sans-serif;
+    backdrop-filter: blur(12px);
   `;
 
   popup.innerHTML = `
-    <input
-      type="text"
-      placeholder="Describe the change..."
-      style="flex:1; background:#2a2a2a; border:1px solid #444; border-radius:4px; color:white; padding:6px 10px; font-size:13px; outline:none;"
-    />
-    <button style="background:#3b82f6; border:none; border-radius:4px; color:white; padding:6px 12px; cursor:pointer; font-size:13px;">
-      &#10148;
-    </button>
+    <div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
+      <span style="color:#60a5fa; font-size:11px; font-weight:600; letter-spacing:0.5px;">CODEDROID EDIT</span>
+      <span style="flex:1"></span>
+      <button id="__cd_close__" style="background:none; border:none; color:#666; cursor:pointer; font-size:16px; padding:0 2px;">&times;</button>
+    </div>
+    <select id="__cd_model_select__" style="
+      background: #16213e;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #94a3b8;
+      padding: 5px 8px;
+      font-size: 12px;
+      outline: none;
+      cursor: pointer;
+      appearance: auto;
+    ">
+      {options_html}
+    </select>
+    <div style="display:flex; gap:6px;">
+      <input
+        type="text"
+        placeholder="Describe the change..."
+        style="flex:1; background:#0f172a; border:1px solid #334155; border-radius:6px; color:#e2e8f0; padding:7px 10px; font-size:13px; outline:none;"
+      />
+      <button id="__cd_send__" style="
+        background: linear-gradient(135deg, #3b82f6, #6366f1);
+        border: none;
+        border-radius: 6px;
+        color: white;
+        padding: 7px 14px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        transition: opacity 0.15s;
+      ">&#10148;</button>
+    </div>
   `;
 
   document.body.appendChild(popup);
@@ -181,17 +237,29 @@ def _floating_input_script(rect: dict) -> str:
     popup.style.top = Math.max(8, {rect["y"]} - popRect.height - 8) + 'px';
   }}
 
-  const input = popup.querySelector('input');
-  const sendBtn = popup.querySelector('button');
+  const input = popup.querySelector('input[type=text]');
+  const sendBtn = popup.querySelector('#__cd_send__');
+  const closeBtn = popup.querySelector('#__cd_close__');
+  const modelSel = popup.querySelector('#__cd_model_select__');
   input.focus();
+
+  closeBtn.onclick = () => popup.remove();
 
   const submit = () => {{
     const prompt = input.value.trim();
     if (!prompt) return;
+    const [provider, ...modelParts] = modelSel.value.split(':');
+    const model = modelParts.join(':');
     if (window.__codedroid_edit_prompt_submitted__) {{
-      window.__codedroid_edit_prompt_submitted__(prompt);
+      window.__codedroid_edit_prompt_submitted__(prompt, provider, model);
     }}
-    popup.remove();
+    // Show a brief "sending..." state
+    input.value = '';
+    input.placeholder = 'Sending...';
+    input.disabled = true;
+    sendBtn.disabled = true;
+    sendBtn.style.opacity = '0.5';
+    setTimeout(() => popup.remove(), 1500);
   }};
 
   sendBtn.onclick = submit;
@@ -219,9 +287,13 @@ class BrowserAgent:
         self.preview_url: Optional[str] = None
         self.dev_server_proc: Optional[asyncio.subprocess.Process] = None
 
+        # Active provider/model — synced from React when edit mode is enabled
+        self.current_provider: str = "groq"
+        self.current_model: str = "llama-3.3-70b-versatile"
+
         # Callbacks set by main.py to forward events to the frontend WebSocket
         self.on_element_clicked: Optional[Callable[[dict], Awaitable[None]]] = None
-        self.on_prompt_submitted: Optional[Callable[[str], Awaitable[None]]] = None
+        self.on_prompt_submitted: Optional[Callable[[str, str, str], Awaitable[None]]] = None
         self.on_console: Optional[Callable[[str, str], Awaitable[None]]] = None
         self.on_closed: Optional[Callable[[], Awaitable[None]]] = None
 
@@ -350,14 +422,21 @@ class BrowserAgent:
         if self.on_element_clicked:
             await self.on_element_clicked(data)
 
-    async def _on_prompt_submitted_raw(self, prompt: str):
+    async def _on_prompt_submitted_raw(self, prompt: str, provider: str = "", model: str = ""):
+        # Use the provider/model from the floating input, or fall back to current
+        p = provider or self.current_provider
+        m = model or self.current_model
         if self.on_prompt_submitted:
-            await self.on_prompt_submitted(prompt)
+            await self.on_prompt_submitted(prompt, p, m)
 
     async def show_floating_input(self, element_data: dict):
         if not self.page:
             return
-        script = _floating_input_script(element_data["rect"])
+        script = _floating_input_script(
+            element_data["rect"],
+            active_provider=self.current_provider,
+            active_model=self.current_model,
+        )
         try:
             await self.page.evaluate(script)
         except Exception:

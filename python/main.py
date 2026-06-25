@@ -1517,6 +1517,18 @@ async def websocket_preview(ws: WebSocket):
     agent.on_console = forward_console
     agent.on_closed = forward_closed
 
+    async def forward_prompt_submitted(prompt: str, provider: str, model: str):
+        """Relay the floating-input prompt submission to React so it can call submit_edit with API keys."""
+        await ws.send_text(json.dumps({
+            "type": "prompt_submitted",
+            "prompt": prompt,
+            "provider": provider,
+            "model": model,
+            "element": agent._last_clicked_element,
+        }))
+
+    agent.on_prompt_submitted = forward_prompt_submitted
+
     # Element data from the most recent click, keyed by selector, so submit_edit
     # (which may arrive from either the in-page floating input OR the chat panel)
     # always has the right context.
@@ -1535,6 +1547,9 @@ async def websocket_preview(ws: WebSocket):
             msg_type = msg.get("type")
 
             if msg_type == "enable_edit_mode":
+                # Sync active provider/model from React so the floating popup pre-selects correctly
+                agent.current_provider = msg.get("provider", agent.current_provider)
+                agent.current_model = msg.get("model", agent.current_model)
                 await agent.enable_edit_mode()
                 await ws.send_text(json.dumps({"type": "edit_mode_enabled"}))
 
@@ -1679,6 +1694,7 @@ async def websocket_preview(ws: WebSocket):
         pass
     finally:
         agent.on_element_clicked = None
+        agent.on_prompt_submitted = None
         agent.on_console = None
         agent.on_closed = None
 

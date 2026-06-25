@@ -78,6 +78,28 @@ export default function PreviewButton() {
           break
         case 'edit_mode_disabled':
           break
+        case 'prompt_submitted': {
+          // The in-browser floating input submitted a prompt.
+          // Resolve the API key from the store (never sent to Playwright) and
+          // send the submit_edit command back to the sidecar.
+          const ps = useStore.getState().settings
+          const prov = data.provider || ps.activeProvider
+          const mdl = data.model || ''
+          const apiKey = prov === 'groq' ? ps.groqKey
+                       : prov === 'gemini' ? ps.geminiKey
+                       : prov === 'claude' ? ps.claudeKey
+                       : ''
+          ws.send(JSON.stringify({
+            type: 'submit_edit',
+            prompt: data.prompt,
+            element: data.element,
+            provider: prov,
+            model: mdl,
+            api_key: apiKey,
+            host: ps.ollamaHost,
+          }))
+          break
+        }
       }
     }
 
@@ -190,7 +212,17 @@ export default function PreviewButton() {
       return
     }
     const next = !editModeActive
-    ws.send(JSON.stringify({ type: next ? 'enable_edit_mode' : 'disable_edit_mode' }))
+    const currentSettings = useStore.getState().settings
+    const prov = currentSettings.activeProvider
+    const mdl = prov === 'groq' ? currentSettings.groqModel
+              : prov === 'gemini' ? currentSettings.geminiModel
+              : prov === 'claude' ? currentSettings.claudeModel
+              : currentSettings.ollamaModel
+    ws.send(JSON.stringify({
+      type: next ? 'enable_edit_mode' : 'disable_edit_mode',
+      provider: prov,
+      model: mdl,
+    }))
     setEditModeActive(next)
     if (!next) setEditingElement(null)
   }
