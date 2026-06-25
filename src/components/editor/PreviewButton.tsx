@@ -150,10 +150,12 @@ export default function PreviewButton() {
         ? `file://${normalized}`
         : `file:///${normalized}`
 
+      const encodedUrl = encodeURI(fileUrl)
+
       const res = await fetch(`${SIDECAR_HTTP}/preview/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: fileUrl, workspace: folderPath || '' }),
+        body: JSON.stringify({ url: encodedUrl, workspace: folderPath || '' }),
       })
 
       if (!res.ok) {
