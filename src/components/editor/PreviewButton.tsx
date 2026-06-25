@@ -97,10 +97,7 @@ export default function PreviewButton() {
 
   const handleStartStop = async () => {
     if (previewActive) {
-      // Stop
-      try {
-        await fetch(`${SIDECAR_HTTP}/preview/stop`, { method: 'POST' })
-      } catch {}
+      try { await fetch(`${SIDECAR_HTTP}/preview/stop`, { method: 'POST' }) } catch {}
       _previewWS?.close()
       _previewWS = null
       setPreviewActive(false)
@@ -109,30 +106,76 @@ export default function PreviewButton() {
     }
 
     if (!file || !isPreviewable) {
-      showToast('❌ Open an HTML file to preview', 'err')
+      showToast('❌ Open an HTML file first — only .html/.htm files can be previewed', 'err')
       return
     }
 
     setStarting(true)
+
+    // ── Step 1: is the sidecar running at all? ─────────────────────────────
     try {
-      const fileUrl = `file://${file.path.replace(/\\/g, '/')}`
+      await fetch(`${SIDECAR_HTTP}/health`, { method: 'GET' })
+    } catch {
+      showToast(
+        '❌ Sidecar not running.\n' +
+        'In a terminal: cd python && uvicorn main:app --host 127.0.0.1 --port 8765',
+        'err'
+      )
+      setStarting(false)
+      return
+    }
+
+    // ── Step 2: is Playwright installed? ───────────────────────────────────
+    try {
+      const chk = await fetch(`${SIDECAR_HTTP}/preview/check`, { method: 'GET' })
+      const chkData = await chk.json()
+      if (!chkData.playwright_available) {
+        showToast(
+          '❌ Playwright not installed.\n' +
+          'Run: pip install playwright && playwright install chromium',
+          'err'
+        )
+        setStarting(false)
+        return
+      }
+    } catch {
+      // /preview/check may not exist yet — skip and try starting anyway
+    }
+
+    // ── Step 3: start the preview ──────────────────────────────────────────
+    try {
+      // Fix Windows path: C:\foo\bar.html → file:///C:/foo/bar.html
+      const normalized = file.path.replace(/\\/g, '/')
+      const fileUrl = normalized.startsWith('/')
+        ? `file://${normalized}`
+        : `file:///${normalized}`
+
       const res = await fetch(`${SIDECAR_HTTP}/preview/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: fileUrl, workspace: folderPath || '' }),
       })
-      const data = await res.json()
-      if (!data.ok) {
-        showToast(`❌ ${data.error || 'Failed to start preview'}`, 'err')
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => `HTTP ${res.status}`)
+        showToast(`❌ Preview start failed: ${txt}`, 'err')
         setStarting(false)
         return
       }
+
+      const data = await res.json()
+      if (!data.ok) {
+        showToast(`❌ ${data.error || 'Preview failed to open'}`, 'err')
+        setStarting(false)
+        return
+      }
+
       reconnectRef.current = 0
       connectSocket()
       setPreviewActive(true, data.url, file.path)
       showToast('✅ Preview started')
     } catch (e: any) {
-      showToast(`❌ ${e.message}`, 'err')
+      showToast(`❌ Preview start error: ${e?.message ?? String(e)}`, 'err')
     } finally {
       setStarting(false)
     }

@@ -1409,6 +1409,15 @@ class StartPreviewRequest(BaseModel):
     height: int = 800
 
 
+@app.get("/preview/check")
+async def preview_check():
+    """Check if Playwright is installed and ready."""
+    return {
+        "playwright_available": PLAYWRIGHT_AVAILABLE,
+        "message": "OK" if PLAYWRIGHT_AVAILABLE else "Run: pip install playwright && playwright install chromium"
+    }
+
+
 @app.post("/preview/start")
 async def preview_start(req: StartPreviewRequest):
     if not PLAYWRIGHT_AVAILABLE:
