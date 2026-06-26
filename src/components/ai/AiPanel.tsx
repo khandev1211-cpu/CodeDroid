@@ -13,6 +13,7 @@ import PromptEnhancer from "./PromptEnhancer"
 import HistoryPanel from "./HistoryPanel"
 import ThinkingBlock from "./ThinkingBlock"
 import TokenLimitPopup from "./TokenLimitPopup"
+import { sidecarHttp, sidecarWs } from "../../lib/sidecar"
 import ElementEditActions from "./ElementEditActions"
 import PendingChangesPanel from "./PendingChangesPanel"
 import { getPreviewSocket } from "../editor/PreviewButton"
@@ -558,7 +559,7 @@ export default function AiPanel() {
     const pasted = e.clipboardData.getData('text')
     if (!pasted || pasted.length < 20) return
     try {
-      const res = await fetch('http://127.0.0.1:8765/detect-error', {
+      const res = await fetch(sidecarHttp('/detect-error'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: pasted }),
       })
@@ -599,7 +600,7 @@ export default function AiPanel() {
 
     return new Promise<void>((resolve) => {
       try {
-        const ws = new WebSocket('ws://127.0.0.1:8765/ws/agent-fix')
+        const ws = new WebSocket(sidecarWs('/ws/agent-fix'))
 
         ws.onopen = () => {
           ws.send(JSON.stringify({
@@ -831,7 +832,7 @@ Important rules for Agent mode:
         }
 
         try {
-          const ws = new WebSocket('ws://127.0.0.1:8765/ws/chat')
+          const ws = new WebSocket(sidecarWs('/ws/chat'))
           let fullText = isContinuation ? continuingMessageOriginalContent : ''
           let agentSteps: AgentStep[] = []
           let wasTruncatedThisTurn = false
@@ -1124,24 +1125,24 @@ Important rules for Agent mode:
           }
         } else if (provider === 'ollama') {
           if (window.api && window.api.ollamaChat) {
-            window.api.removeOllamaListeners()
+            window.api.removeOllamaListeners?.()
 
             await new Promise<void>((resolve, reject) => {
-              window.api.onOllamaChunk((chunk: any) => {
+              window.api.onOllamaChunk?.((chunk: any) => {
                 fullText += chunk.message?.content || ''
                 updateAiMessage(assistantId, fullText, true)
               })
 
-              window.api.onOllamaDone(() => {
+              window.api.onOllamaDone?.(() => {
                 resolve()
               })
 
-              window.api.ollamaChat(settings.ollamaHost, {
+              window.api.ollamaChat?.(settings.ollamaHost, {
                 model: model,
                 stream: true,
                 messages: [{ role: 'system', content: systemInjected }, ...finalMessages]
-              }).then(res => {
-                if (!res.ok) reject(new Error(res.error))
+              }).then((res: { ok: boolean; error?: string } | undefined) => {
+                if (res && !res.ok) reject(new Error(res.error))
               })
             })
           } else {

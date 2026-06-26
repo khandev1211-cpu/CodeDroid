@@ -178,7 +178,7 @@ function InlineInput({ depth, isDir, initialValue = '', onConfirm, onCancel, exi
 }
 
 // ─── Context Menu ─────────────────────────────────────────────────────────────
-interface CtxItem { label: string; icon?: string; shortcut?: string; danger?: boolean; separator?: boolean; action?: () => void }
+interface CtxItem { label?: string; icon?: string; shortcut?: string; danger?: boolean; separator?: boolean; action?: () => void }
 
 function ContextMenu({ x, y, items, onClose }: { x: number; y: number; items: CtxItem[]; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)

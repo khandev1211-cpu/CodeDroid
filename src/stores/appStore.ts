@@ -691,12 +691,10 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
           if (provider === 'ollama') {
             // Use Native IPC Bridge to bypass CORS
             if (window.api && window.api.getOllamaModels) {
-              const res = await window.api.getOllamaModels(settings.ollamaHost)
-              if (res.ok && res.models && res.models.length > 0) {
-                set((s) => ({ availableModels: { ...s.availableModels, ollama: res.models } }))
+              const models = await window.api.getOllamaModels(settings.ollamaHost)
+              if (Array.isArray(models) && models.length > 0) {
+                set((s) => ({ availableModels: { ...s.availableModels, ollama: models } }))
                 return
-              } else if (!res.ok) {
-                console.warn("Native Ollama fetch failed:", res.error)
               }
             }
 

@@ -224,7 +224,7 @@ export default function TerminalPanel() {
               )}
             </div>
           ))}
-          <button className="icon-btn" onClick={addTerminalTab} title="New Terminal" style={{ width: 24, height: 24 }}>
+          <button className="icon-btn" onClick={() => addTerminalTab()} title="New Terminal" style={{ width: 24, height: 24 }}>
             <Plus size={12} />
           </button>
         </div>
