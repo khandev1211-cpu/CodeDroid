@@ -6,25 +6,34 @@ contextBridge.exposeInMainWorld('api', {
   maximize: () => ipcRenderer.invoke('window:maximize'),
   close:    () => ipcRenderer.invoke('window:close'),
 
-  // File system
-  openFolder:  () => ipcRenderer.invoke('fs:open-folder'),
-  openFile:    () => ipcRenderer.invoke('fs:open-file'),
-  readFile:    (p)       => ipcRenderer.invoke('fs:read-file', p),
-  writeFile:   (p, c)    => ipcRenderer.invoke('fs:write-file', p, c),
-  readDir:     (p)       => ipcRenderer.invoke('fs:read-dir', p),
-  createFile:  (p)       => ipcRenderer.invoke('fs:create-file', p),
-  createDir:   (p)       => ipcRenderer.invoke('fs:create-dir', p),
-  rename:      (o, n)    => ipcRenderer.invoke('fs:rename', o, n),
-  deleteItem:  (p)       => ipcRenderer.invoke('fs:delete-item', p),
-  copyFile:    (s, d)    => ipcRenderer.invoke('fs:copy-file', s, d),
-  copy:        (s, d)    => ipcRenderer.invoke('fs:copy', s, d),
-  exists:      (p)       => ipcRenderer.invoke('fs:exists', p),
-  revealInExplorer: (p)  => ipcRenderer.invoke('fs:reveal', p),
+  // App meta
+  getSidecarPort: () => ipcRenderer.invoke('app:sidecar-port'),
 
-  // Settings
+  // File system
+  openFolder:       ()       => ipcRenderer.invoke('fs:open-folder'),
+  openFile:         ()       => ipcRenderer.invoke('fs:open-file'),
+  readFile:         (p)      => ipcRenderer.invoke('fs:read-file', p),
+  writeFile:        (p, c)   => ipcRenderer.invoke('fs:write-file', p, c),
+  readDir:          (p)      => ipcRenderer.invoke('fs:read-dir', p),
+  createFile:       (p)      => ipcRenderer.invoke('fs:create-file', p),
+  createDir:        (p)      => ipcRenderer.invoke('fs:create-dir', p),
+  rename:           (o, n)   => ipcRenderer.invoke('fs:rename', o, n),
+  deleteItem:       (p)      => ipcRenderer.invoke('fs:delete-item', p),
+  copyFile:         (s, d)   => ipcRenderer.invoke('fs:copy-file', s, d),
+  copy:             (s, d)   => ipcRenderer.invoke('fs:copy', s, d),
+  exists:           (p)      => ipcRenderer.invoke('fs:exists', p),
+  revealInExplorer: (p)      => ipcRenderer.invoke('fs:reveal', p),
+
+  // Settings (non-sensitive — themes, font, layout, etc.)
   storeGet:    (k)    => ipcRenderer.invoke('store:get', k),
   storeSet:    (k, v) => ipcRenderer.invoke('store:set', k, v),
   storeGetAll: ()     => ipcRenderer.invoke('store:get-all'),
+
+  // Encrypted API keys (safeStorage — OS keychain backed)
+  keysSet:    (k, v) => ipcRenderer.invoke('keys:set', k, v),
+  keysGet:    (k)    => ipcRenderer.invoke('keys:get', k),
+  keysGetAll: ()     => ipcRenderer.invoke('keys:get-all'),
+  keysDelete: (k)    => ipcRenderer.invoke('keys:delete', k),
 
   // Git
   gitRun: (cwd, args) => ipcRenderer.invoke('git:run', cwd, args),

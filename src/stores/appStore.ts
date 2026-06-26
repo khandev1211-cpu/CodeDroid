@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { sidecarHttp, sidecarWs } from '../lib/sidecar'
 import { persist } from 'zustand/middleware'
 import { themes, applyTheme, Theme } from '../themes/themes'
 
@@ -275,6 +276,7 @@ interface AppStore {
   // Actions: UI
   setActivePanel: (p: Panel) => void
   updateSettings: (s: Partial<Settings>) => void
+  loadEncryptedKeys: () => Promise<void>
   applyThemeById: (id: string) => void
   setCommandPaletteOpen: (b: boolean) => void
   setInlineAi: (open: boolean, target?: { line: number; selection: string } | null) => void
@@ -344,7 +346,7 @@ export const useStore = create<AppStore>()(
 
         // Notify sidecar of new workspace
         try {
-          await fetch('http://localhost:8765/set-workspace', {
+          await fetch(sidecarHttp('/set-workspace'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ path: p })
@@ -501,7 +503,7 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
         const trySidecar = async () => {
           return new Promise<boolean>((resolve) => {
             try {
-              const ws = new WebSocket('ws://127.0.0.1:8765/ws/chat')
+              const ws = new WebSocket(sidecarWs('/ws/chat'))
               let fullText = ''
               let hasReceivedData = false
 
@@ -700,7 +702,7 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
 
             // Fallback 1: Try via Python sidecar
             try {
-              const res = await fetch(`http://localhost:8765/models/ollama?host=${encodeURIComponent(settings.ollamaHost)}`)
+              const res = await fetch(sidecarHttp(`/models/ollama?host=${encodeURIComponent(settings.ollamaHost)}`))
               const data = await res.json()
               if (data.ok && data.models && data.models.length > 0) {
                 set((s) => ({ availableModels: { ...s.availableModels, ollama: data.models } }))
@@ -908,9 +910,32 @@ Be concise, technical, and precise. Format code with proper markdown code blocks
       // ── UI actions ─────────────────────────────────────────────────────────
       setActivePanel: (activePanel) => set({ activePanel }),
 
-      updateSettings: (s) => set((st) => ({
-        settings: { ...st.settings, ...s }
-      })),
+      loadEncryptedKeys: async () => {
+        try {
+          const keys = await window.api?.keysGetAll?.()
+          if (keys) {
+            set((st) => ({
+              settings: {
+                ...st.settings,
+                groqKey: keys.groqKey || st.settings.groqKey,
+                geminiKey: keys.geminiKey || st.settings.geminiKey,
+                claudeKey: keys.claudeKey || st.settings.claudeKey,
+              }
+            }))
+          }
+        } catch { /* api not available in browser env */ }
+      },
+
+      updateSettings: (s) => {
+        // Persist API keys via encrypted safeStorage
+        const API_KEYS = ['groqKey', 'geminiKey', 'claudeKey'] as const
+        for (const k of API_KEYS) {
+          if (k in s && typeof (s as any)[k] === 'string') {
+            window.api?.keysSet?.(k, (s as any)[k])
+          }
+        }
+        set((st) => ({ settings: { ...st.settings, ...s } }))
+      },
 
       applyThemeById: (id) => {
         const theme = themes.find(t => t.id === id) || themes[0]

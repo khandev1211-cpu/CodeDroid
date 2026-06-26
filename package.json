@@ -1,11 +1,73 @@
 {
   "name": "codedroid",
-  "version": "3.0.0",
+  "version": "4.0.0",
+  "description": "AI-native desktop IDE — open source",
   "main": "electron/main.js",
+  "author": "Ramzan Khan",
+  "license": "MIT",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "build": "vite build",
-    "rebuild": "electron-rebuild -f -w node-pty"
+    "typecheck": "tsc --noEmit",
+    "rebuild": "electron-rebuild -f -w node-pty",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux",
+    "dist": "npm run build && electron-builder --win --mac --linux"
+  },
+  "build": {
+    "appId": "com.codedroid.app",
+    "productName": "CodeDroid",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "python/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "python",
+        "to": "python",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] }
+      ],
+      "icon": "assets/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist"
+    },
+    "linux": {
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "deb", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.png",
+      "category": "Development"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "khandev1211-cpu",
+      "repo": "CodeDroid"
+    }
   },
   "dependencies": {
     "@monaco-editor/react": "4.6.0",
@@ -14,6 +76,7 @@
     "@xterm/xterm": "5.5.0",
     "clsx": "2.1.0",
     "electron-store": "8.1.0",
+    "electron-updater": "^6.3.0",
     "lucide-react": "0.344.0",
     "monaco-editor": "0.45.0",
     "node-pty": "^1.1.0",
@@ -29,6 +92,7 @@
     "concurrently": "8.2.0",
     "cross-env": "7.0.3",
     "electron": "29.4.6",
+    "electron-builder": "^24.13.0",
     "typescript": "5.3.3",
     "vite": "5.1.6",
     "wait-on": "7.2.0"
