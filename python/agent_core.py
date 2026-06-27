@@ -24,6 +24,7 @@ from typing import Optional, AsyncIterator
 import httpx
 
 from tools import execute_tool, TOOLS, resolve_confirmation
+from mcp_bus import get_bus
 from context_manager import (
     trim_messages, build_system_prompt, sanitize_user_input,
     get_output_limit, get_input_limit,
@@ -68,11 +69,47 @@ MAX_AGENT_ITERATIONS = 10
 
 
 # ── Tool description string (for providers that don't support native tool-calling) ─
+async def _execute_any_tool(tool_name: str, args: dict, ws=None, session_id=None) -> str:
+    """
+    Route tool calls to either built-in tools or MCP servers.
+    MCP tools are prefixed: mcp_{server_id}_{tool_name}
+    """
+    if tool_name.startswith("mcp_"):
+        # Parse: mcp_{server_id}_{tool_name} — server_id may contain underscores
+        # so we match against known servers
+        bus = get_bus()
+        all_tools = bus.list_all_tools()
+        match = next((t for t in all_tools if t["name"] == tool_name), None)
+        if match:
+            return await bus.call_tool(match["server_id"], match["tool_name"], args)
+        return f"Error: MCP tool '{tool_name}' not found"
+    return await execute_tool(tool_name, args, ws, session_id)
+
+
+def _get_all_tools() -> list[dict]:
+    """Return built-in tools + all connected MCP tools for function-calling."""
+    all_tools = list(TOOLS)
+    bus = get_bus()
+    for mcp_tool in bus.list_all_tools():
+        all_tools.append({
+            "type": "function",
+            "function": {
+                "name": mcp_tool["name"],
+                "description": mcp_tool["description"],
+                "parameters": mcp_tool.get("input_schema", {
+                    "type": "object", "properties": {}, "required": []
+                }),
+            }
+        })
+    return all_tools
+
+
 def _tools_description() -> str:
-    return "\n".join(
+    lines = [
         f"- {t['function']['name']}: {t['function']['description']}"
-        for t in TOOLS
-    )
+        for t in _get_all_tools()
+    ]
+    return "\n".join(lines)
 
 AGENT_TOOL_PROMPT = (
     "\n\nYou have access to tools. To call a tool, output ONLY a JSON object on its own "
@@ -289,7 +326,7 @@ async def run_agent(
                             args = {}
 
                         await _send(ws, {"type": "tool_start", "tool": name, "args": args})
-                        result = await execute_tool(name, args, ws, session_id)
+                        result = await _execute_any_tool(name, args, ws, session_id)
                         await _send(ws, {"type": "tool_end", "tool": name, "output": result})
                         log_message(session_id, "tool", result[:500], tool_name=name)
                         summary_parts.append(f"{name}({list(args.keys())})")
@@ -365,7 +402,7 @@ async def run_agent(
                                 args = block.get("input", {})
                                 tool_id = block.get("id", "")
                                 await _send(ws, {"type": "tool_start", "tool": name, "args": args})
-                                result = await execute_tool(name, args, ws, session_id)
+                                result = await _execute_any_tool(name, args, ws, session_id)
                                 await _send(ws, {"type": "tool_end", "tool": name, "output": result})
                                 log_message(session_id, "tool", result[:500], tool_name=name)
                                 summary_parts.append(f"{name}({list(args.keys())})")
@@ -488,7 +525,7 @@ async def run_agent(
                     if tool_call:
                         name, args = tool_call
                         await _send(ws, {"type": "tool_start", "tool": name, "args": args})
-                        result = await execute_tool(name, args, ws, session_id)
+                        result = await _execute_any_tool(name, args, ws, session_id)
                         await _send(ws, {"type": "tool_end", "tool": name, "output": result})
                         log_message(session_id, "tool", result[:500], tool_name=name)
                         summary_parts.append(f"{name}({list(args.keys())})")
@@ -555,7 +592,7 @@ async def run_agent(
                         # Suppress the raw JSON from being shown in UI
                         await _send(ws, {"type": "clear_last_token"})
                         await _send(ws, {"type": "tool_start", "tool": name, "args": args})
-                        result = await execute_tool(name, args, ws, session_id)
+                        result = await _execute_any_tool(name, args, ws, session_id)
                         await _send(ws, {"type": "tool_end", "tool": name, "output": result})
                         log_message(session_id, "tool", result[:500], tool_name=name)
                         summary_parts.append(f"{name}({list(args.keys())})")

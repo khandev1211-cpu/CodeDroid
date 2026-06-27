@@ -56,10 +56,23 @@ from tools import execute_tool as tool_execute, set_workspace as tools_set_works
 from context_manager import sanitize_user_input
 from memory import init_db
 
+# ─── Phase 2: MCP Plugin Bus ──────────────────────────────────────────────────
+from mcp_bus import get_bus
+
 # Initialise SQLite memory DB on startup
 init_db()
 
 app = FastAPI(title="CodeDroid AI Sidecar", version="4.0.0")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the MCP plugin bus on sidecar startup."""
+    try:
+        bus = get_bus()
+        await bus.initialize()
+        print("[MCP] Plugin bus initialized")
+    except Exception as e:
+        print(f"[MCP] Bus init warning: {e}")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Agent auto-fix constants ──────────────────────────────────────────────────
@@ -649,6 +662,46 @@ async def enhance_prompt(req: ChatRequest):
         return {"enhanced": prompt, "error": str(e)}
 
 # ─── WebSocket streaming AI ───────────────────────────────────────────────────
+# ─── MCP Plugin REST endpoints ───────────────────────────────────────────────
+
+@app.get("/mcp/servers")
+async def mcp_list_servers():
+    """List all registered MCP servers and their status."""
+    return {"ok": True, "servers": get_bus().list_servers()}
+
+@app.get("/mcp/tools")
+async def mcp_list_tools():
+    """List all available tools from all connected MCP servers."""
+    return {"ok": True, "tools": get_bus().list_all_tools()}
+
+@app.post("/mcp/install")
+async def mcp_install_server(body: dict):
+    """Install a new MCP server from a manifest."""
+    result = await get_bus().install_server(body)
+    return result
+
+@app.post("/mcp/toggle")
+async def mcp_toggle_server(body: dict):
+    """Enable or disable an MCP server."""
+    result = await get_bus().toggle_server(body.get("id", ""), body.get("enabled", True))
+    return result
+
+@app.delete("/mcp/uninstall/{server_id}")
+async def mcp_uninstall_server(server_id: str):
+    """Uninstall an MCP server."""
+    result = await get_bus().uninstall_server(server_id)
+    return result
+
+@app.post("/mcp/call")
+async def mcp_call_tool(body: dict):
+    """Directly call an MCP tool (used by UI for testing)."""
+    result = await get_bus().call_tool(
+        body.get("server_id", ""),
+        body.get("tool_name", ""),
+        body.get("args", {}),
+    )
+    return {"ok": True, "result": result}
+
 @app.websocket("/ws/chat")
 async def websocket_chat(ws: WebSocket):
     """
