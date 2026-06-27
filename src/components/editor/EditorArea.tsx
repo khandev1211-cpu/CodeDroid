@@ -6,7 +6,6 @@ import { useStore } from '../../stores/appStore'
 import { applyErrorDecorations, clearErrorDecorations } from './ErrorDecorations'
 import ProblemsPanel from './ProblemsPanel'
 import PreviewButton from './PreviewButton'
-import { useCollabStore } from '../../stores/collabStore'
 import './EditorArea.css'
 
 const LANG_ICON_COLOR: Record<string, string> = {
