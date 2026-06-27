@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Search, Replace, CaseSensitive, Regex, Loader2, FileCode } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
 
@@ -11,7 +11,20 @@ export default function SearchPanel() {
   const [useRegex, setUseRegex] = useState(false)
   const [showReplace, setShowReplace] = useState(false)
 
-  const handleSearch = () => runSearch({ caseSensitive, useRegex })
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Auto-search with 400ms debounce as user types
+  const handleSearch = useCallback(() => {
+    if (searchQuery.trim().length < 2) return
+    runSearch({ caseSensitive, useRegex })
+  }, [searchQuery, caseSensitive, useRegex, runSearch])
+
+  useEffect(() => {
+    if (!searchQuery.trim()) return
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => handleSearch(), 400)
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
+  }, [searchQuery, caseSensitive, useRegex])
 
   const handleOpenResult = async (filePath: string, line: number) => {
     if (!window.api) return
@@ -33,7 +46,7 @@ export default function SearchPanel() {
       <div className="panel-header">
         <span>Search</span>
         <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
-          {searchResults.length > 0 ? `${searchResults.length} results` : ''}
+          {searchLoading ? 'Searching...' : searchResults.length > 0 ? `${searchResults.length} results` : ''}
         </span>
       </div>
       <div style={{ padding: '8px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>

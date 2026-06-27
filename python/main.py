@@ -54,7 +54,7 @@ except ImportError:
 from agent_core import run_agent
 from tools import execute_tool as tool_execute, set_workspace as tools_set_workspace, resolve_confirmation, TOOLS
 from context_manager import sanitize_user_input
-from memory import init_db
+from memory import init_db, search_messages
 
 # ─── Phase 2: MCP Plugin Bus ──────────────────────────────────────────────────
 from mcp_bus import get_bus
@@ -701,6 +701,23 @@ async def mcp_call_tool(body: dict):
         body.get("args", {}),
     )
     return {"ok": True, "result": result}
+
+@app.get("/memory/search")
+async def memory_search(q: str = ""):
+    """Full-text search across chat history stored in SQLite."""
+    if not q or len(q) < 2:
+        return {"ok": True, "results": []}
+    results = search_messages(q, limit=20)
+    return {"ok": True, "results": results}
+
+
+@app.get("/memory/sessions")
+async def memory_sessions(project: str = ""):
+    """Get recent agent sessions for a project."""
+    from memory import get_recent_sessions
+    sessions = get_recent_sessions(project, limit=10)
+    return {"ok": True, "sessions": sessions}
+
 
 @app.websocket("/ws/chat")
 async def websocket_chat(ws: WebSocket):

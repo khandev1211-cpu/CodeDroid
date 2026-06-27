@@ -72,7 +72,7 @@ export default function CommandPalette() {
         desc: f.path,
         icon: FileCode,
         preview: f.content.slice(0, 200),
-        action: () => store.setActiveFileIndex(i),
+        action: () => store.setActiveFile(i),
       })
     })
 

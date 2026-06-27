@@ -4,6 +4,8 @@ import {
   FilePlus, FolderPlus, RefreshCw, ChevronsUpDown,
 } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
+import { useVirtualTree, flattenTree, FlatRow } from '../../hooks/useVirtualTree'
+import { notify } from '../../lib/notifications'
 import './FilesPanel.css'
 
 // ─── Cross-platform path utilities ────────────────────────────────────────────
@@ -578,7 +580,19 @@ export default function FilesPanel() {
   const [refreshKey,   setRefreshKey]   = useState(0)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [creatingIn,   setCreatingIn]   = useState<CreatingIn>(null)
+  const [expanded,    setExpanded]    = useState<Set<string>>(new Set())
+  const [panelHeight, setPanelHeight] = useState(400)
   const panelRef = useRef<HTMLDivElement>(null)
+
+  // Track panel height for virtual tree
+  useEffect(() => {
+    if (!panelRef.current) return
+    const obs = new ResizeObserver(entries => {
+      setPanelHeight(entries[0].contentRect.height)
+    })
+    obs.observe(panelRef.current)
+    return () => obs.disconnect()
+  }, [])
 
   const loadRoot = useCallback(async () => {
     if (!folderPath || !window.api) return
@@ -602,6 +616,7 @@ export default function FilesPanel() {
       res = await window.api.readFile(node.path)
     } catch (e: any) {
       console.error('[FilesPanel] readFile IPC error:', e)
+      notify.error('Cannot read file', String(e))
       return
     }
     if (res.ok) {
@@ -612,6 +627,7 @@ export default function FilesPanel() {
       })
     } else {
       console.error('[FilesPanel] readFile failed:', res.error, 'path:', node.path)
+      notify.error('Cannot open file', res.error || 'Permission denied or file not found')
     }
   }
 

@@ -69,6 +69,17 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_session  ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_file_log_session  ON file_log(session_id);
             CREATE INDEX IF NOT EXISTS idx_file_log_path     ON file_log(file_path);
+
+            -- Full-text search virtual table for messages
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+            USING fts5(content, role, session_id UNINDEXED, rowid UNINDEXED,
+                       content='messages', content_rowid='id');
+
+            -- Keep FTS in sync with messages table
+            CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, role, session_id)
+                VALUES (new.id, new.content, new.role, new.session_id);
+            END;
         """)
 
 
@@ -158,6 +169,35 @@ def get_file_history(file_path: str, limit: int = 10) -> list[dict]:
             (file_path, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Full-text search ──────────────────────────────────────────────────────────
+
+def search_messages(query: str, limit: int = 20) -> list[dict]:
+    """Full-text search across all chat history using SQLite FTS5."""
+    with _connect() as conn:
+        try:
+            rows = conn.execute(
+                """SELECT m.session_id, m.role, m.content, m.created_at
+                   FROM messages m
+                   JOIN messages_fts fts ON m.id = fts.rowid
+                   WHERE messages_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query, limit)
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            # Fallback to LIKE search if FTS table not populated yet
+            rows = conn.execute(
+                """SELECT session_id, role, content, created_at
+                   FROM messages
+                   WHERE content LIKE ?
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (f'%{query}%', limit)
+            ).fetchall()
+            return [dict(r) for r in rows]
 
 
 # ── KV store ───────────────────────────────────────────────────────────────────
