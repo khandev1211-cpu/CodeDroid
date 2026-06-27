@@ -50,7 +50,16 @@ except ImportError:
     def get_browser_agent(): raise RuntimeError("browser_agent module not available")
     async def reset_browser_agent(): raise RuntimeError("browser_agent module not available")
 
-app = FastAPI(title="CodeDroid AI Sidecar", version="3.0.0")
+# ─── Phase 1: Agent core modules ──────────────────────────────────────────────
+from agent_core import run_agent
+from tools import execute_tool as tool_execute, set_workspace as tools_set_workspace, resolve_confirmation, TOOLS
+from context_manager import sanitize_user_input
+from memory import init_db
+
+# Initialise SQLite memory DB on startup
+init_db()
+
+app = FastAPI(title="CodeDroid AI Sidecar", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Agent auto-fix constants ──────────────────────────────────────────────────
@@ -480,13 +489,14 @@ async def detect_error_endpoint(body: dict):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "4.0.0", "phase": "phase1"}
 
 
 @app.post("/set-workspace")
 async def set_workspace(body: dict):
     global _workspace_root
     _workspace_root = body.get("path", "")
+    tools_set_workspace(_workspace_root)   # keep tools.py in sync
     return {"ok": True, "workspace": _workspace_root}
 
 
@@ -641,605 +651,59 @@ async def enhance_prompt(req: ChatRequest):
 # ─── WebSocket streaming AI ───────────────────────────────────────────────────
 @app.websocket("/ws/chat")
 async def websocket_chat(ws: WebSocket):
+    """
+    WebSocket chat endpoint — thin wrapper around agent_core.run_agent().
+    Handles: connection lifecycle, tool confirmation responses, message parsing.
+    """
     await ws.accept()
     try:
         while True:
             data = await ws.receive_text()
-            req = ChatRequest(**json.loads(data))
+            msg = json.loads(data)
 
-            # Dynamic Skill Injection
+            # ── Tool confirmation response from UI ─────────────────────────
+            if msg.get("type") == "tool_confirm_response":
+                resolve_confirmation(msg["id"], msg.get("approved", False))
+                continue
+
+            req = ChatRequest(**msg)
+
+            # Skill injection
             skill_blocks = []
             for skill_id in req.skills:
-                content = get_skill_content(skill_id)
-                if content:
-                    skill_blocks.append(content)
-
+                c = get_skill_content(skill_id)
+                if c:
+                    skill_blocks.append(c)
             skill_context = "\n".join(skill_blocks)
 
-            system = req.system or (
+            base_system = req.system or (
                 "You are CodeDroid AI Copilot, an expert coding assistant. "
-                "Be concise, technical, and precise. Format code with markdown."
+                "Be concise, technical, and precise. Format code in markdown."
             )
-
             if skill_context:
-                system = f"{system}\n\nUSE THESE SPECIALIZED SKILLS AND RULES:\n{skill_context}"
+                base_system = f"{base_system}\n\nUSE THESE SKILLS:\n{skill_context}"
 
-            # ── Groq free tier: 8000 TPM (input + output combined) ────────────
-            # Cap system prompt at 800 chars (~200 tokens)
-            # Trim history to last 4 messages, 400 chars each (~400 tokens)
-            # Output capped at 2000 tokens → total ~3100 tokens → safely under 8000
-            MAX_SYS_CHARS  = 800
-            MAX_HIST_MSGS  = 4
-            MAX_HIST_CHARS = 400
-
-            if len(system) > MAX_SYS_CHARS:
-                system = system[:MAX_SYS_CHARS]
-
-            # Trim history for Groq — applied per-provider below
-            def trim_messages_for_groq(messages: list) -> list:
-                trimmed = [m for m in messages if m.get("content") and m.get("role") != "tool"]
-                trimmed = trimmed[-MAX_HIST_MSGS:]
-                return [
-                    {**m, "content": m["content"][:MAX_HIST_CHARS] if isinstance(m["content"], str) else m["content"]}
-                    for m in trimmed
-                ]
-
-            try:
-                # Tool descriptions for prompt-injection providers (Ollama, Gemini)
-                TOOLS_DESCRIPTION = "\n".join(
-                    f"- {t['function']['name']}: {t['function']['description']}"
-                    for t in TOOLS
-                )
-                AGENT_TOOL_PROMPT = (
-                    "\n\nYou have access to the following tools. To call a tool, output ONLY a "
-                    "JSON object on its own line in this exact format (no markdown, no backticks):\n"
-                    '{"tool":"<name>","args":{<args>}}\n'
-                    "After each tool call you will receive a [TOOL RESULT] message. "
-                    "Continue calling tools as needed. When fully done, output your final answer.\n\n"
-                    f"Available tools:\n{TOOLS_DESCRIPTION}"
-                )
-
-                async with httpx.AsyncClient(timeout=120) as client:
-
-                    if req.provider == "groq":
-                        # ── Groq: native function-calling agent loop ─────────────────────
-                        groq_history = trim_messages_for_groq(req.messages)
-                        groq_model = req.model or "llama-3.3-70b-versatile"
-                        if groq_model.startswith("compound"):
-                            await ws.send_text(json.dumps({
-                                "type": "token",
-                                "text": f'⚠️ "{groq_model}" is a Groq system agent, not a direct chat model.\n\nPlease select a chat model like:\n• openai/gpt-oss-120b\n• llama-3.3-70b-versatile\n• mixtral-8x7b-32768'
-                            }))
-                            await ws.send_text(json.dumps({"type": "done"}))
-                            return
-                        groq_max_tokens = GROQ_MAX_TOKENS.get(groq_model, GROQ_MAX_TOKENS["default"])
-
-                        # ── Thinking mode ──────────────────────────────────────────────────
-                        use_thinking = req.thinking or should_use_thinking(req.messages[-1].get("content","") if req.messages else "", req.mode)
-                        native_think = is_native_thinking_model(groq_model)
-
-                        groq_system = system
-                        if use_thinking and not native_think:
-                            groq_system = inject_cot_into_system(system)
-
-                        if use_thinking:
-                            await ws.send_text(json.dumps({"type": "thinking_start"}))
-
-                        current_messages = [{"role": "system", "content": groq_system}] + groq_history
-                        max_iterations = 8 if req.mode == "agent" else 1
-
-                        for i in range(max_iterations):
-                            payload: dict = {
-                                "model": groq_model,
-                                "stream": True,
-                                "max_tokens": groq_max_tokens,
-                                "messages": current_messages,
-                            }
-                            if req.mode == "agent":
-                                payload["tools"] = TOOLS
-                                payload["tool_choice"] = "auto"
-
-                            tool_calls: list = []
-                            full_content = ""
-                            finish_reason = ""
-                            async with client.stream(
-                                "POST", "https://api.groq.com/openai/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {req.api_key}"},
-                                json=payload,
-                            ) as resp:
-                                async for line in resp.aiter_lines():
-                                    if line.startswith("data: ") and line != "data: [DONE]":
-                                        try:
-                                            chunk = json.loads(line[6:])
-                                            choice = chunk["choices"][0]
-                                            delta = choice["delta"]
-                                            finish_reason = choice.get("finish_reason") or finish_reason
-                                            if "content" in delta and delta["content"]:
-                                                full_content += delta["content"]
-                                                await ws.send_text(json.dumps({"type": "token", "text": delta["content"]}))
-                                            if "tool_calls" in delta:
-                                                for tc in delta["tool_calls"]:
-                                                    while len(tool_calls) <= tc["index"]:
-                                                        tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                                                    if "id" in tc: tool_calls[tc["index"]]["id"] += tc["id"]
-                                                    if "function" in tc:
-                                                        if "name" in tc["function"]: tool_calls[tc["index"]]["function"]["name"] += tc["function"]["name"]
-                                                        if "arguments" in tc["function"]: tool_calls[tc["index"]]["function"]["arguments"] += tc["function"]["arguments"]
-                                        except: pass
-
-                            # Extract thinking block for native models
-                            if use_thinking and native_think and full_content:
-                                thinking, full_content = extract_think_tags(full_content)
-                                if thinking:
-                                    await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
-
-                            # Truncation detection
-                            # Ask/Plan: always emit — frontend shows the Continue popup
-                            # Agent: only emit when the loop is actually ending truncated
-                            # (no tool call follow-up, so the agent can't self-correct via another turn)
-                            if was_response_truncated(finish_reason, "groq"):
-                                if req.mode != "agent":
-                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
-                                elif not tool_calls:
-                                    # Agent mode hit the token limit with no further tool calls queued —
-                                    # the final answer itself got cut off. Auto-continue inline.
-                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
-
-                            if not tool_calls:
-                                break
-
-                            current_messages.append({"role": "assistant", "content": full_content, "tool_calls": tool_calls})
-                            for tc in tool_calls:
-                                name = tc["function"]["name"]
-                                try:
-                                    args = json.loads(tc["function"]["arguments"])
-                                except Exception:
-                                    args = {}
-                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                result = await execute_tool(name, args, ws)
-                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
-                                current_messages.append({
-                                    "role": "tool", "tool_call_id": tc["id"],
-                                    "name": name, "content": result,
-                                })
-                            if i == max_iterations - 1:
-                                await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
-
-                    elif req.provider == "claude":
-                        # ── Claude: native tool_use API ──────────────────────────────────
-                        claude_model = req.model or "claude-sonnet-4-20250514"
-
-                        if req.mode == "agent":
-                            claude_tools = [
-                                {"name": t["function"]["name"],
-                                 "description": t["function"]["description"],
-                                 "input_schema": t["function"]["parameters"]}
-                                for t in TOOLS
-                            ]
-                            current_messages = list(req.messages)
-                            max_iterations = 8
-
-                            for i in range(max_iterations):
-                                r = await client.post(
-                                    "https://api.anthropic.com/v1/messages",
-                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                                    json={
-                                        "model": claude_model, "max_tokens": 4096,
-                                        "system": system, "tools": claude_tools,
-                                        "tool_choice": {"type": "auto"},
-                                        "messages": current_messages,
-                                    },
-                                )
-                                resp_data = r.json()
-                                stop_reason = resp_data.get("stop_reason", "")
-                                content_blocks = resp_data.get("content", [])
-
-                                for block in content_blocks:
-                                    if block.get("type") == "text" and block.get("text"):
-                                        await ws.send_text(json.dumps({"type": "token", "text": block["text"]}))
-
-                                if stop_reason != "tool_use":
-                                    if was_response_truncated(stop_reason, "claude"):
-                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": stop_reason}))
-                                    break
-
-                                tool_results = []
-                                for block in content_blocks:
-                                    if block.get("type") == "tool_use":
-                                        name = block["name"]
-                                        args = block.get("input", {})
-                                        tool_id = block.get("id", "")
-                                        await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                        result = await execute_tool(name, args, ws)
-                                        await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
-                                        tool_results.append({"type": "tool_result", "tool_use_id": tool_id, "content": result})
-
-                                current_messages.append({"role": "assistant", "content": content_blocks})
-                                current_messages.append({"role": "user", "content": tool_results})
-                                if i == max_iterations - 1:
-                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
-                        else:
-                            # ── Claude Ask/Plan — streaming with thinking support ─────────
-                            use_thinking = req.thinking or should_use_thinking(
-                                req.messages[-1].get("content","") if req.messages else "", req.mode)
-
-                            claude_payload: dict = {
-                                "model": claude_model, "max_tokens": 4096, "stream": True,
-                                "system": system, "messages": req.messages,
-                            }
-
-                            # Claude native extended thinking
-                            if use_thinking and "claude" in claude_model:
-                                claude_payload["thinking"] = {"type": "enabled", "budget_tokens": 5000}
-                                claude_payload["max_tokens"] = 8000  # thinking needs headroom
-                                claude_payload["stream"] = False    # streaming + thinking not yet stable
-                                await ws.send_text(json.dumps({"type": "thinking_start"}))
-                                r = await client.post(
-                                    "https://api.anthropic.com/v1/messages",
-                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01",
-                                             "content-type": "application/json",
-                                             "anthropic-beta": "interleaved-thinking-2025-05-14"},
-                                    json=claude_payload,
-                                )
-                                resp_data = r.json()
-                                for block in resp_data.get("content", []):
-                                    if block.get("type") == "thinking":
-                                        await ws.send_text(json.dumps({"type": "thinking", "text": block.get("thinking", "")}))
-                                    elif block.get("type") == "text":
-                                        await ws.send_text(json.dumps({"type": "token", "text": block.get("text", "")}))
-                                if was_response_truncated(resp_data.get("stop_reason",""), "claude"):
-                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": resp_data.get("stop_reason","")}))
-                            else:
-                                finish_reason = ""
-                                async with client.stream(
-                                    "POST", "https://api.anthropic.com/v1/messages",
-                                    headers={"x-api-key": req.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                                    json=claude_payload,
-                                ) as resp:
-                                    async for line in resp.aiter_lines():
-                                        if line.startswith("data: "):
-                                            try:
-                                                chunk = json.loads(line[6:])
-                                                if chunk.get("type") == "content_block_delta":
-                                                    token = chunk["delta"].get("text", "")
-                                                    if token:
-                                                        await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                                elif chunk.get("type") == "message_delta":
-                                                    finish_reason = chunk.get("delta", {}).get("stop_reason", "")
-                                            except: pass
-                                if was_response_truncated(finish_reason, "claude"):
-                                    await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish_reason}))
-
-                    elif req.provider == "ollama":
-                        # ── Ollama: prompt-injection agent loop ──────────────────────────
-                        ollama_model = req.model or "llama3"
-
-                        if req.mode == "agent":
-                            agent_system = system + AGENT_TOOL_PROMPT
-                            current_messages = [{"role": "system", "content": agent_system}] + req.messages
-                            max_iterations = 8
-                            for i in range(max_iterations):
-                                r = await client.post(
-                                    f"{req.host}/api/chat",
-                                    json={"model": ollama_model, "stream": False, "messages": current_messages},
-                                )
-                                reply_data = r.json()
-                                reply = reply_data.get("message", {}).get("content", "")
-                                current_messages.append({"role": "assistant", "content": reply})
-                                tool_called = False
-                                for ln in reply.splitlines():
-                                    ln = ln.strip()
-                                    if ln.startswith("{") and '"tool"' in ln:
-                                        try:
-                                            call = json.loads(ln)
-                                            name = call.get("tool", "")
-                                            args = call.get("args", {})
-                                            if name:
-                                                tool_called = True
-                                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                                result = await execute_tool(name, args, ws)
-                                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
-                                                current_messages.append({"role": "user", "content": f"[TOOL RESULT for {name}]\n{result}"})
-                                        except: pass
-                                if not tool_called:
-                                    await ws.send_text(json.dumps({"type": "token", "text": reply}))
-                                    if was_response_truncated(reply_data.get("done_reason", ""), "ollama"):
-                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": reply_data.get("done_reason", "")}))
-                                    break
-                                if i == max_iterations - 1:
-                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
-                        else:
-                            # ── Ollama Ask/Plan — streaming with thinking support ─────────
-                            use_thinking = req.thinking or should_use_thinking(
-                                req.messages[-1].get("content","") if req.messages else "", req.mode)
-                            native_think_ol = is_native_thinking_model(ollama_model)
-                            ollama_system = system
-                            if use_thinking and not native_think_ol:
-                                ollama_system = inject_cot_into_system(system)
-                            if use_thinking:
-                                await ws.send_text(json.dumps({"type": "thinking_start"}))
-                            async with client.stream(
-                                "POST", f"{req.host}/api/chat",
-                                json={"model": ollama_model, "stream": True,
-                                      "messages": [{"role": "system", "content": ollama_system}] + req.messages},
-                            ) as resp:
-                                full_ol = ""
-                                async for line in resp.aiter_lines():
-                                    if line.strip():
-                                        try:
-                                            chunk = json.loads(line)
-                                            token = chunk.get("message", {}).get("content", "")
-                                            if token:
-                                                full_ol += token
-                                                await ws.send_text(json.dumps({"type": "token", "text": token}))
-                                            if chunk.get("done") and was_response_truncated(chunk.get("done_reason",""), "ollama"):
-                                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": chunk.get("done_reason","")}))
-                                        except: pass
-                            if use_thinking and native_think_ol:
-                                thinking, _ = extract_think_tags(full_ol)
-                                if thinking:
-                                    await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
-
-                    else:  # gemini
-                        # ── Gemini: prompt-injection agent loop ──────────────────────────
-                        gemini_model = req.model or "gemini-1.5-pro"
-
-                        if req.mode == "agent":
-                            agent_system = system + AGENT_TOOL_PROMPT
-                            gemini_messages = list(req.messages)
-                            max_iterations = 8
-                            for i in range(max_iterations):
-                                r = await client.post(
-                                    f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
-                                    params={"key": req.api_key},
-                                    json={
-                                        "system_instruction": {"parts": [{"text": agent_system}]},
-                                        "contents": gemini_messages,
-                                    },
-                                )
-                                gem_resp = r.json()
-                                gem_candidate = gem_resp.get("candidates", [{}])[0]
-                                reply = gem_candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
-                                gem_finish = gem_candidate.get("finishReason", "")
-                                gemini_messages.append({"role": "model", "parts": [{"text": reply}]})
-                                tool_called = False
-                                for ln in reply.splitlines():
-                                    ln = ln.strip()
-                                    if ln.startswith("{") and '"tool"' in ln:
-                                        try:
-                                            call = json.loads(ln)
-                                            name = call.get("tool", "")
-                                            args = call.get("args", {})
-                                            if name:
-                                                tool_called = True
-                                                await ws.send_text(json.dumps({"type": "tool_start", "tool": name, "args": args}))
-                                                result = await execute_tool(name, args, ws)
-                                                await ws.send_text(json.dumps({"type": "tool_end", "tool": name, "output": result}))
-                                                gemini_messages.append({"role": "user", "parts": [{"text": f"[TOOL RESULT for {name}]\n{result}"}]})
-                                        except: pass
-                                if not tool_called:
-                                    await ws.send_text(json.dumps({"type": "token", "text": reply}))
-                                    if was_response_truncated(gem_finish, "gemini"):
-                                        await ws.send_text(json.dumps({"type": "truncated", "finish_reason": gem_finish}))
-                                    break
-                                if i == max_iterations - 1:
-                                    await ws.send_text(json.dumps({"type": "token", "text": "\n\n*(Max agent iterations reached)*"}))
-                        else:
-                            # ── Gemini Ask/Plan with thinking support ─────────────────────
-                            use_thinking_gem = req.thinking or should_use_thinking(
-                                req.messages[-1].get("content","") if req.messages else "", req.mode)
-                            native_think_gem = is_native_thinking_model(gemini_model)
-
-                            gem_json: dict = {
-                                "system_instruction": {"parts": [{"text": system}]},
-                                "contents": req.messages,
-                            }
-                            # Gemini 2.0 flash-thinking / 2.5 support thinking budget
-                            if use_thinking_gem and native_think_gem:
-                                gem_json["generationConfig"] = {"thinkingConfig": {"thinkingBudget": 8192}}
-                                await ws.send_text(json.dumps({"type": "thinking_start"}))
-                            elif use_thinking_gem:
-                                gem_json["system_instruction"]["parts"][0]["text"] = inject_cot_into_system(system)
-                                await ws.send_text(json.dumps({"type": "thinking_start"}))
-
-                            r = await client.post(
-                                f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
-                                params={"key": req.api_key},
-                                json=gem_json,
-                            )
-                            data = r.json()
-                            candidate = data.get("candidates", [{}])[0]
-                            finish = candidate.get("finishReason", "")
-                            for part in candidate.get("content", {}).get("parts", []):
-                                part_text = part.get("text", "")
-                                if not part_text:
-                                    continue
-                                if part.get("thought"):
-                                    await ws.send_text(json.dumps({"type": "thinking", "text": part_text}))
-                                else:
-                                    if use_thinking_gem and not native_think_gem:
-                                        # CoT: extract <thinking> tags from plain text
-                                        thinking, answer = extract_think_tags(part_text)
-                                        if thinking:
-                                            await ws.send_text(json.dumps({"type": "thinking", "text": thinking}))
-                                        await ws.send_text(json.dumps({"type": "token", "text": answer}))
-                                    else:
-                                        await ws.send_text(json.dumps({"type": "token", "text": part_text}))
-                            if was_response_truncated(finish, "gemini"):
-                                await ws.send_text(json.dumps({"type": "truncated", "finish_reason": finish}))
-
-                await ws.send_text(json.dumps({"type": "done"}))
-
-            except Exception as e:
-                await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+            await run_agent(
+                ws=ws,
+                provider=req.provider,
+                api_key=req.api_key,
+                model=req.model,
+                messages=req.messages,
+                system=base_system,
+                mode=req.mode,
+                thinking=req.thinking,
+                skills=req.skills,
+                workspace=_workspace_root,
+                ollama_host=req.host,
+            )
 
     except WebSocketDisconnect:
         pass
-
-
-# ─── Auto-Fix Helpers ─────────────────────────────────────────────────────────
-
-async def _get_ai_fix(
-    api_key: str, provider: str, model: str, host: str,
-    file_path: str, file_content: str, error: dict, command: str,
-) -> str:
-    """Call the AI to get a surgical fix for a broken file. Returns corrected file content."""
-    fix_prompt = f"""You are an expert debugger. Fix the following file.
-
-File: {file_path}
-Line: {error.get('line_number', 'unknown')}
-Error type: {error.get('error_type', 'unknown')}
-Error message: {error.get('error_message', 'unknown')}
-Command run: {command}
-
-Rules:
-1. Identify the exact root cause
-2. Make the minimal surgical fix — change only what is broken
-3. Do NOT refactor, rename, or restructure anything else
-4. Return ONLY the corrected full file content — no explanation, no markdown fences
-
-File content:
-{file_content}"""
-
-    messages = [{"role": "user", "content": fix_prompt}]
-    system = "You are an expert debugger. Return ONLY corrected file content, nothing else."
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        if provider == "groq":
-            m = model or "llama3-70b-8192"
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": m, "max_tokens": GROQ_MAX_TOKENS.get(m, 8192),
-                      "messages": [{"role": "system", "content": system}] + messages},
-            )
-            return r.json()["choices"][0]["message"]["content"]
-
-        elif provider == "claude":
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model or "claude-sonnet-4-20250514", "max_tokens": 4096,
-                      "system": system, "messages": messages},
-            )
-            return r.json()["content"][0]["text"]
-
-        elif provider == "gemini":
-            r = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-1.5-pro'}:generateContent",
-                params={"key": api_key},
-                json={"system_instruction": {"parts": [{"text": system}]},
-                      "contents": [{"role": "user", "parts": [{"text": fix_prompt}]}]},
-            )
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-        else:  # ollama
-            r = await client.post(f"{host}/api/chat", json={
-                "model": model or "llama3", "stream": False,
-                "messages": [{"role": "system", "content": system}] + messages,
-            })
-            return r.json()["message"]["content"]
-
-
-async def _get_ai_completion(system: str, prompt: str, api_key: str, provider: str, model: str, host: str = "http://localhost:11434", max_tokens: int = 4096) -> str:
-    """Generic single-turn AI completion helper, used by the Live Preview / Edit Mode system."""
-    messages = [{"role": "user", "content": prompt}]
-    async with httpx.AsyncClient(timeout=60) as client:
-        if provider == "groq":
-            m = model or "llama-3.3-70b-versatile"
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": m, "max_tokens": min(max_tokens, GROQ_MAX_TOKENS.get(m, 2000)),
-                      "messages": [{"role": "system", "content": system}] + messages},
-            )
-            data = r.json()
-            if "choices" not in data:
-                raise RuntimeError(data.get("error", {}).get("message", "Groq request failed"))
-            return data["choices"][0]["message"]["content"]
-
-        elif provider == "claude":
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": model or "claude-sonnet-4-20250514", "max_tokens": max_tokens,
-                      "system": system, "messages": messages},
-            )
-            data = r.json()
-            if "content" not in data:
-                raise RuntimeError(data.get("error", {}).get("message", "Claude request failed"))
-            return data["content"][0]["text"]
-
-        elif provider == "gemini":
-            r = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model or 'gemini-1.5-pro'}:generateContent",
-                params={"key": api_key},
-                json={"system_instruction": {"parts": [{"text": system}]},
-                      "contents": [{"role": "user", "parts": [{"text": prompt}]}]},
-            )
-            data = r.json()
-            if "candidates" not in data:
-                raise RuntimeError(data.get("error", {}).get("message", "Gemini request failed"))
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-
-        else:  # ollama
-            r = await client.post(f"{host}/api/chat", json={
-                "model": model or "llama3", "stream": False,
-                "messages": [{"role": "system", "content": system}] + messages,
-            })
-            return r.json()["message"]["content"]
-
-
-def _strip_json_fences(text: str) -> str:
-    """Strip accidental markdown fences from an AI response expected to be raw JSON or file content."""
-    t = text.strip()
-    if t.startswith("```"):
-        lines = t.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        t = "\n".join(lines)
-    return t.strip()
-
-
-async def _run_command_capture(command: str, workspace: str) -> dict:
-    """Run a shell command and return structured result with error detection."""
-    cwd = workspace or _workspace_root or None
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-    )
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return {"stdout": "", "stderr": "Timed out", "exit_code": -1, "had_error": True}
-    stdout = stdout_b.decode(errors="replace")
-    stderr = stderr_b.decode(errors="replace")
-    combined = stdout + stderr
-    had_error = (proc.returncode != 0) or bool(stderr.strip())
-    return {
-        "stdout": stdout[:3000],
-        "stderr": stderr[:3000],
-        "exit_code": proc.returncode,
-        "had_error": had_error,
-        "output": combined[:4000],
-    }
-
-
-# ─── /ws/agent-fix WebSocket ──────────────────────────────────────────────────
-class AgentFixRequest(BaseModel):
-    command: str                  # The command to run (and re-run after fixes)
-    workspace: str = ""           # Workspace root path
-    file_path: str = ""           # Optional: specific file to fix (if known)
-    error_text: str = ""          # Optional: pre-pasted error text
-    provider: str = "groq"
-    api_key: str = ""
-    model: str = ""
-    host: str = "http://localhost:11434"
+    except Exception as e:
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
 
 
 @app.websocket("/ws/agent-fix")

@@ -597,13 +597,21 @@ export default function FilesPanel() {
 
   const handleFileOpen = async (node: TreeNode) => {
     if (!window.api) return
-    const res = await window.api.readFile(node.path)
+    let res: { ok: boolean; content: string; error?: string }
+    try {
+      res = await window.api.readFile(node.path)
+    } catch (e: any) {
+      console.error('[FilesPanel] readFile IPC error:', e)
+      return
+    }
     if (res.ok) {
       openFile({
         path: node.path, name: node.name, content: res.content,
         language: getLanguage(node.name), isDirty: false,
         cursorLine: 1, cursorCol: 1, scrollTop: 0,
       })
+    } else {
+      console.error('[FilesPanel] readFile failed:', res.error, 'path:', node.path)
     }
   }
 

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
-import Editor, { OnMount } from '@monaco-editor/react'
+import Editor, { OnMount, loader } from '@monaco-editor/react'
+import * as monaco from 'monaco-editor'
 import { X, Circle, ChevronRight, SplitSquareHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/appStore'
 import { applyErrorDecorations, clearErrorDecorations } from './ErrorDecorations'
@@ -42,6 +43,11 @@ function TabBar() {
     </div>
   )
 }
+
+// ── Configure Monaco loader once at module level ─────────────────────────────
+// Use the locally bundled monaco-editor instead of CDN/dynamic loading.
+// This is the correct pattern for Electron + Vite — avoids worker path issues.
+loader.config({ monaco })
 
 function Breadcrumbs() {
   const { openFiles, activeFileIndex, settings } = useStore()
@@ -310,12 +316,26 @@ export default function EditorArea() {
       <Breadcrumbs />
       <div className="editor-container">
         <Editor
-          key={file.path}
           language={file.language}
           value={file.content}
+          path={file.path}
           theme={getMonacoTheme()}
           onChange={handleChange}
           onMount={handleEditorMount}
+
+          loading={
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              height: '100%', color: 'var(--text-muted)', fontSize: 13, gap: 8,
+            }}>
+              <div style={{
+                width: 16, height: 16, border: '2px solid var(--accent)',
+                borderTopColor: 'transparent', borderRadius: '50%',
+                animation: 'spin 0.7s linear infinite',
+              }} />
+              Opening {file.name}...
+            </div>
+          }
           options={{
             fontSize:               settings.fontSize,
             fontFamily:             settings.fontFamily,

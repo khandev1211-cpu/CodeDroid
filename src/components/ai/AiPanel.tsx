@@ -14,6 +14,7 @@ import HistoryPanel from "./HistoryPanel"
 import ThinkingBlock from "./ThinkingBlock"
 import TokenLimitPopup from "./TokenLimitPopup"
 import { sidecarHttp, sidecarWs } from "../../lib/sidecar"
+import ToolConfirmModal from "./ToolConfirmModal"
 import ElementEditActions from "./ElementEditActions"
 import PendingChangesPanel from "./PendingChangesPanel"
 import { getPreviewSocket } from "../editor/PreviewButton"
@@ -497,6 +498,10 @@ export default function AiPanel() {
   const [useDeepThink, setUseDeepThink] = useState(false)
   const [pendingEditPreview, setPendingEditPreview] = useState<{ change: DomChange; element: ElementData } | null>(null)
   const [editSubmitting, setEditSubmitting] = useState(false)
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    id: string; tool: string; args: Record<string, any>;
+    risk: 'high' | 'medium' | 'low'; message: string
+  } | null>(null)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
@@ -833,6 +838,7 @@ Important rules for Agent mode:
 
         try {
           const ws = new WebSocket(sidecarWs('/ws/chat'))
+            ;(window as any).__codedroid_active_ws = ws
           let fullText = isContinuation ? continuingMessageOriginalContent : ''
           let agentSteps: AgentStep[] = []
           let wasTruncatedThisTurn = false
@@ -904,6 +910,8 @@ Important rules for Agent mode:
               useStore.setState((s) => ({
                 aiMessages: s.aiMessages.map(m => m.id === assistantId ? { ...m, agentSteps: [...agentSteps] } : m)
               }))
+            } else if (data.type === 'tool_confirm_required') {
+              setPendingConfirm({ id: data.id, tool: data.tool, args: data.args, risk: data.risk, message: data.message })
             } else if (data.type === 'tool_start') {
               agentSteps.push({ id: Math.random().toString(), tool: data.tool, input: JSON.stringify(data.args), status: 'running' })
               useStore.setState((s) => ({
@@ -1262,6 +1270,14 @@ Important rules for Agent mode:
   // Keep sendRef pointed at the latest send() closure (settings/aiMessages change every render)
   useEffect(() => { sendRef.current = send })
 
+  const handleConfirmRespond = (id: string, approved: boolean) => {
+    setPendingConfirm(null)
+    const activeWs = (window as any).__codedroid_active_ws
+    if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+      activeWs.send(JSON.stringify({ type: 'tool_confirm_response', id, approved }))
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
@@ -1296,6 +1312,7 @@ Important rules for Agent mode:
   const filteredCmds = SLASH_COMMANDS.filter(c => input === "/" || c.cmd.startsWith(input.split(" ")[0]))
 
   return (
+    <>
     <div className="ai-panel">
       <div className="panel-header">
         <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
@@ -1433,5 +1450,9 @@ Important rules for Agent mode:
 
       <PendingChangesPanel />
     </div>
+    {pendingConfirm && (
+      <ToolConfirmModal confirm={pendingConfirm} onRespond={handleConfirmRespond} />
+    )}
+    </>
   )
 }
