@@ -1,12 +1,15 @@
-import { Files, Search, GitBranch, Package, Settings } from "lucide-react"
-import { useStore, Panel } from "../stores/appStore"
+import { Files, Search, GitBranch, Package, Settings , Users } from "lucide-react"
+import { useStore, Panel  } from "../stores/appStore"
+
+
 import "./ActivityBar.css"
 
 const panels: { id: Panel; icon: any; label: string }[] = [
   { id: "files",      icon: Files,    label: "Explorer (Ctrl+Shift+E)" },
   { id: "search",     icon: Search,   label: "Search (Ctrl+Shift+F)" },
   { id: "git",        icon: GitBranch,label: "Source Control" },
-  { id: "extensions", icon: Package,  label: "Extensions" },
+  { id: "extensions", icon: Package,  label: "MCP Plugins" },
+  { id: "collab",     icon: Users,   label: "Collaboration" },
   { id: "settings",   icon: Settings, label: "Settings" },
 ]
 

@@ -1,7 +1,7 @@
 {
   "name": "codedroid",
   "version": "4.0.0",
-  "description": "AI-native desktop IDE — open source",
+  "description": "AI-native desktop IDE \u2014 open source",
   "main": "electron/main.js",
   "author": "Ramzan Khan",
   "license": "MIT",
@@ -32,18 +32,31 @@
       {
         "from": "python",
         "to": "python",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.ico"
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "icon": "assets/icon.icns",
       "hardenedRuntime": true,
@@ -53,8 +66,18 @@
     },
     "linux": {
       "target": [
-        { "target": "AppImage", "arch": ["x64"] },
-        { "target": "deb", "arch": ["x64"] }
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.png",
       "category": "Development"
@@ -82,7 +105,11 @@
     "node-pty": "^1.1.0",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "zustand": "4.5.0"
+    "zustand": "4.5.0",
+    "yjs": "^13.6.18",
+    "y-webrtc": "^10.2.5",
+    "y-monaco": "^0.1.5",
+    "lib0": "^0.2.93"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",

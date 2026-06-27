@@ -6,7 +6,7 @@ import { themes, applyTheme, Theme } from '../themes/themes'
 // ─── Types ────────────────────────────────────────────────────────────────────
 export type AiProvider = 'groq' | 'gemini' | 'ollama' | 'claude'
 export type ChatMode = 'plan' | 'agent' | 'ask'
-export type Panel = 'files' | 'search' | 'git' | 'extensions' | 'settings'
+export type Panel = 'files' | 'search' | 'git' | 'extensions' | 'settings' | 'collab'
 
 export interface OpenFile {
   path: string
