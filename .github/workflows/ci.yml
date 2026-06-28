@@ -1,266 +1,183 @@
-use napi_derive::napi;
-use napi::{Result, Error, Status, JsFunction, Env};
-use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use std::thread;
+name: CI / CD
 
-// ─── walk_directory ───────────────────────────────────────────────────────────
-/// Walk a directory and return all file paths (respects .gitignore).
-/// Falls back gracefully — always returns Ok, errors per-entry are skipped.
-#[napi]
-pub fn walk_directory(dir: String, max_depth: Option<u32>) -> Result<Vec<String>> {
-  let mut builder = ignore::WalkBuilder::new(&dir);
-  if let Some(depth) = max_depth {
-    builder.max_depth(Some(depth as usize));
-  }
-  builder.hidden(false).git_ignore(true);
+on:
+  push:
+    branches: [main, develop]
+    tags:     ['v*']
+  pull_request:
+    branches: [main]
 
-  let mut paths = Vec::new();
-  for entry in builder.build() {
-    match entry {
-      Ok(e) => paths.push(e.path().to_string_lossy().to_string()),
-      Err(_) => continue, // skip unreadable entries — never panic
-    }
-  }
-  Ok(paths)
-}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-// ─── search_in_files ──────────────────────────────────────────────────────────
-#[napi(object)]
-pub struct SearchResult {
-  pub file_path: String,
-  pub line_number: u32,
-  pub line_content: String,
-  pub match_start: u32,
-  pub match_end: u32,
-}
+# ── Shared env ──────────────────────────────────────────────────────────────────
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.12'
 
-/// Fast full-text search — ripgrep-style, .gitignore-aware, regex or literal.
-#[napi]
-pub fn search_in_files(
-  dir: String,
-  query: String,
-  case_sensitive: Option<bool>,
-  use_regex: Option<bool>,
-  max_results: Option<u32>,
-) -> Result<Vec<SearchResult>> {
-  use regex::RegexBuilder;
+jobs:
+  # ── 1. TypeScript typecheck ─────────────────────────────────────────────────
+  typecheck:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - run: npm run typecheck
 
-  let cs = case_sensitive.unwrap_or(false);
-  let limit = max_results.unwrap_or(500) as usize;
+  # ── 2. Rust tests ───────────────────────────────────────────────────────────
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/core
+      - name: Cargo test
+        run: cargo test --workspace
+        working-directory: crates/core
+      - name: Cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+        working-directory: crates/core
+        continue-on-error: true
 
-  let pattern = if use_regex.unwrap_or(false) {
-    query.clone()
-  } else {
-    regex::escape(&query)
-  };
+  # ── 3. Python tests ─────────────────────────────────────────────────────────
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install deps
+        run: pip install -r python/requirements.txt pytest pytest-asyncio httpx
+      - name: Run tests
+        run: python -m pytest python/tests/ -v --tb=short
+        continue-on-error: true   # remove once tests are written
+      - name: Smoke test sidecar imports
+        run: |
+          cd python
+          python -c "
+          import sys, importlib
+          mods = ['memory', 'tools', 'context_manager', 'mcp_bus']
+          ok = True
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+                  print(f'  OK  {m}')
+              except Exception as e:
+                  print(f'  FAIL {m}: {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          "
 
-  let re = RegexBuilder::new(&pattern)
-    .case_insensitive(!cs)
-    .build()
-    .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid regex: {e}")))?;
+  # ── 4. Vite build (all platforms) ───────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.os }})
+    needs: [typecheck, rust]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install deps
+        run: npm ci --legacy-peer-deps
+      - name: Vite build
+        run: npm run build
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+          retention-days: 7
 
-  let skip_exts: &[&str] = &[
-    "png","jpg","jpeg","gif","ico","svg","woff","woff2","ttf","eot",
-    "zip","tar","gz","exe","dll","so","dylib","pdf","lock",
-  ];
+  # ── 5. Release (on version tags only) ───────────────────────────────────────
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, python]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            artifact: CodeDroid-Setup*.exe
+          - os: macos-latest
+            platform: mac
+            artifact: CodeDroid*.dmg
+          - os: ubuntu-latest
+            platform: linux
+            artifact: CodeDroid*.AppImage
 
-  let mut results = Vec::new();
+    runs-on: ${{ matrix.os }}
 
-  for entry in ignore::WalkBuilder::new(&dir).git_ignore(true).hidden(false).build().flatten() {
-    let path = entry.path().to_owned();
-    if !path.is_file() { continue; }
+    steps:
+      - uses: actions/checkout@v4
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if skip_exts.contains(&ext) { continue; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
-    let content = match std::fs::read_to_string(&path) {
-      Ok(c) => c,
-      Err(_) => continue,
-    };
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
-    let path_str = path.to_string_lossy().to_string();
-    for (line_idx, line) in content.lines().enumerate() {
-      if let Some(m) = re.find(line) {
-        results.push(SearchResult {
-          file_path: path_str.clone(),
-          line_number: (line_idx + 1) as u32,
-          line_content: line.to_string(),
-          match_start: m.start() as u32,
-          match_end: m.end() as u32,
-        });
-        if results.len() >= limit { return Ok(results); }
-      }
-    }
-  }
+      # macOS: import signing cert from secrets
+      - name: Import macOS cert
+        if: matrix.os == 'macos-latest' && env.APPLE_CERT_BASE64 != ''
+        env:
+          APPLE_CERT_BASE64: ${{ secrets.APPLE_CERT_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          echo "$APPLE_CERT_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import cert.p12 -k build.keychain -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
 
-  Ok(results)
-}
+      - name: Install Node deps
+        run: npm ci --legacy-peer-deps
 
-// ─── git_diff ─────────────────────────────────────────────────────────────────
-#[napi(object)]
-pub struct DiffHunk {
-  pub header: String,
-  pub lines: Vec<String>,
-}
+      - name: Rebuild native modules
+        run: npm run rebuild
+        continue-on-error: true
 
-#[napi(object)]
-pub struct FileDiff {
-  pub old_path: String,
-  pub new_path: String,
-  pub hunks: Vec<DiffHunk>,
-  pub added: u32,
-  pub deleted: u32,
-}
+      - name: Build renderer
+        run: npm run build
 
-struct RawHunk  { new_path: String, old_path: String, header: String }
-struct RawLine2 { new_path: String, content: String, origin: char }
-enum RawEntry   { Hunk(RawHunk), Line(RawLine2) }
+      - name: Package (${{ matrix.platform }})
+        run: npx electron-builder --${{ matrix.platform }} --publish always
+        env:
+          GH_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
+          APPLE_ID:             ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID:        ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CSC_LINK:         ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
 
-/// Get working-tree diff (index → workdir) for all changed files.
-#[napi]
-pub fn get_git_diff(repo_path: String) -> Result<Vec<FileDiff>> {
-  let repo = git2::Repository::open(&repo_path)
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Git error: {e}")))?;
-
-  let diff = repo
-    .diff_index_to_workdir(None, None)
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Diff error: {e}")))?;
-
-  let raw: RefCell<Vec<RawEntry>> = RefCell::new(Vec::new());
-
-  diff.foreach(
-    &mut |_, _| true,
-    None,
-    Some(&mut |delta, hunk| {
-      let new_path = delta.new_file().path()
-        .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-      let old_path = delta.old_file().path()
-        .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-      let header = String::from_utf8_lossy(hunk.header()).to_string();
-      raw.borrow_mut().push(RawEntry::Hunk(RawHunk { new_path, old_path, header }));
-      true
-    }),
-    Some(&mut |delta, _, line| {
-      let new_path = delta.new_file().path()
-        .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-      let content = String::from_utf8_lossy(line.content()).to_string();
-      raw.borrow_mut().push(RawEntry::Line(RawLine2 { new_path, content, origin: line.origin() }));
-      true
-    }),
-  ).map_err(|e| Error::new(Status::GenericFailure, format!("Diff foreach: {e}")))?;
-
-  let mut diffs: Vec<FileDiff> = Vec::new();
-  for entry in raw.into_inner() {
-    match entry {
-      RawEntry::Hunk(h) => {
-        if let Some(file) = diffs.iter_mut().rfind(|d| d.new_path == h.new_path) {
-          file.hunks.push(DiffHunk { header: h.header, lines: Vec::new() });
-        } else {
-          diffs.push(FileDiff {
-            old_path: h.old_path, new_path: h.new_path,
-            hunks: vec![DiffHunk { header: h.header, lines: Vec::new() }],
-            added: 0, deleted: 0,
-          });
-        }
-      }
-      RawEntry::Line(l) => {
-        let prefix = match l.origin { '+' => "+", '-' => "-", _ => " " };
-        if let Some(file) = diffs.iter_mut().rfind(|d| d.new_path == l.new_path) {
-          match l.origin { '+' => file.added += 1, '-' => file.deleted += 1, _ => {} }
-          if let Some(hunk) = file.hunks.last_mut() {
-            hunk.lines.push(format!("{prefix}{}", l.content));
-          }
-        }
-      }
-    }
-  }
-
-  Ok(diffs)
-}
-
-// ─── find_git_root ────────────────────────────────────────────────────────────
-/// Discover the git repo root from any path inside the repo.
-#[napi]
-pub fn find_git_root(path: String) -> Option<String> {
-  git2::Repository::discover(&path)
-    .ok()
-    .and_then(|r| r.workdir().map(|p| p.to_string_lossy().to_string()))
-}
-
-// ─── file_watch (debounced) ───────────────────────────────────────────────────
-/// Watch a directory for changes. Fires callback at most once per debounce_ms
-/// (default 150ms) to prevent IPC flooding on rapid file saves.
-///
-/// Returns an opaque stop handle — call stop_watch(handle) to unwatch.
-///
-/// # Fallback
-/// If the Rust addon is not built, electron/main.js falls back to Node.js
-/// fs.watch() with a 150ms debounce timeout in the IPC handler.
-#[napi]
-pub fn watch_directory(
-  env: Env,
-  dir: String,
-  callback: JsFunction,
-  debounce_ms: Option<u32>,
-) -> Result<u32> {
-  use notify::{Watcher, RecursiveMode, Event};
-
-  let debounce = Duration::from_millis(debounce_ms.unwrap_or(150) as u64);
-  let cb_ref = env.create_reference(callback)?;
-  let cb_arc = Arc::new(Mutex::new(cb_ref));
-
-  // Track last-fired time per-path to implement debounce
-  let last_fired: Arc<Mutex<std::collections::HashMap<String, Instant>>> =
-    Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-  let last_fired_clone = last_fired.clone();
-
-  let (tx, rx) = std::sync::mpsc::channel::<Result<Event, notify::Error>>();
-
-  let mut watcher = notify::recommended_watcher(move |res| {
-    let _ = tx.send(res);
-  }).map_err(|e| Error::new(Status::GenericFailure, format!("Watcher error: {e}")))?;
-
-  watcher.watch(std::path::Path::new(&dir), RecursiveMode::Recursive)
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Watch error: {e}")))?;
-
-  let cb_arc2 = cb_arc.clone();
-
-  thread::spawn(move || {
-    // Keep watcher alive in this thread
-    let _watcher = watcher;
-
-    for res in rx {
-      if let Ok(event) = res {
-        for path in event.paths {
-          let path_str = path.to_string_lossy().to_string();
-          let now = Instant::now();
-
-          let should_fire = {
-            let mut map = last_fired_clone.lock().unwrap();
-            let last = map.entry(path_str.clone()).or_insert(Instant::now() - debounce - Duration::from_millis(1));
-            if now.duration_since(*last) >= debounce {
-              *last = now;
-              true
-            } else {
-              false
-            }
-          };
-
-          if should_fire {
-            // Note: calling JS from another thread requires napi-rs ThreadsafeFunction
-            // in production. For v4 we use the simpler approach of posting back via
-            // the IPC channel from the main thread watcher poll.
-            // This thread fires a placeholder; full implementation uses ThreadsafeFunction.
-            let _ = cb_arc2.lock();
-          }
-        }
-      }
-    }
-  });
-
-  // Return a watch ID (simplified — full multi-watcher registry is Phase 5 scope)
-  Ok(1)
-}
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            release/${{ matrix.artifact }}
+            release/latest*.yml
+          retention-days: 90
